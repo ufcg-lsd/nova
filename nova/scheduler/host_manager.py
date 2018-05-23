@@ -124,6 +124,9 @@ class HostState(object):
         self.pci_stats = None
         self.numa_topology = None
 
+        # SGX
+        self.epc_used = 0
+        
         # Additional host information from the compute node stats:
         self.num_instances = 0
         self.num_io_ops = 0
@@ -168,6 +171,10 @@ class HostState(object):
             # message will be dispatched in it's own green thread. So the
             # shared host state should be updated in a consistent way to make
             # sure its data is valid under concurrent write operations.
+            # SGX: if statement inst_dict in the beggining
+            if inst_dict is not None:
+                LOG.debug("Update host state with instances: %s", inst_dict)
+                self.instances = inst_dict
             if compute is not None:
                 LOG.debug("Update host state from compute node: %s", compute)
                 self._update_from_compute_node(compute)
@@ -177,9 +184,6 @@ class HostState(object):
             if service is not None:
                 LOG.debug("Update host state with service dict: %s", service)
                 self.service = ReadOnlyDict(service)
-            if inst_dict is not None:
-                LOG.debug("Update host state with instances: %s", inst_dict)
-                self.instances = inst_dict
 
         return _locked_update(self, compute, service, aggregates, inst_dict)
 
@@ -191,6 +195,11 @@ class HostState(object):
             LOG.debug('Ignoring compute node %s as its usage has not been '
                       'updated yet.', compute.uuid)
             return
+
+        # SGX
+        self.epc_used = self._get_epc_used()
+        LOG.debug("[EPC allocation] %(epc_in_use)d MB of EPC used on compute "
+                  "%(compute_node)s", {'epc_in_use': epc_used, 'compute_node': compute})
 
         if (self.updated and compute.updated_at
                 and self.updated > compute.updated_at):
@@ -280,6 +289,12 @@ class HostState(object):
         self.free_disk_mb -= disk_mb
         self.vcpus_used += vcpus
 
+        # SGX
+        epc_to_be_allocated = int(spec_obj.flavor.extra_specs.get('sgx:epc_size'))
+        if epc_to_be_allocated:
+	    self.epc_used += epc_to_be_allocated
+
+
         # Track number of instances on host
         self.num_instances += 1
 
@@ -330,6 +345,15 @@ class HostState(object):
                  'free_ram': self.free_ram_mb, 'free_disk': self.free_disk_mb,
                  'num_io_ops': self.num_io_ops,
                  'num_instances': self.num_instances})
+    # SGX
+    def _get_epc_used(self):
+        compute_epc = 0
+        for instance in self.instances.values():
+            flavor = instance.get("flavor")
+            flavor_epc = flavor.extra_specs.get("sgx:epc_size")
+            if flavor_epc:
+                compute_epc += int(flavor_epc)
+        return compute_epc
 
 
 class HostManager(object):

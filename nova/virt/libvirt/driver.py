@@ -5041,6 +5041,25 @@ class LibvirtDriver(driver.ComputeDriver):
                                       disk_info, rescue, block_device_info,
                                       context)
         xml = conf.to_xml()
+        
+        #SGX
+        extra_specs = instance.flavor.extra_specs
+        if extra_specs:
+           sgx_epc = extra_specs.get('sgx:epc_size')
+           if sgx_epc:
+              qemu_ns = " xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'"
+              qemu_tags = '''
+               <qemu:commandline>
+               <qemu:arg value='-machine'/>
+               <qemu:arg value='epc=''' + sgx_epc + '''M'/>
+               <qemu:arg value='-cpu'/>
+               <qemu:arg value='host'/>
+               </qemu:commandline>
+              '''
+           xml = xml[:18] + qemu_ns + xml[18:]
+           xml = xml[:-10] + qemu_tags + xml[-10:]
+
+
 
         LOG.debug('End _get_guest_xml xml=%(xml)s',
                   {'xml': xml}, instance=instance)
