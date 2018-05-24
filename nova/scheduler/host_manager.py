@@ -199,7 +199,7 @@ class HostState(object):
         # SGX
         self.epc_used = self._get_epc_used()
         LOG.debug("[EPC allocation] %(epc_in_use)d MB of EPC used on compute "
-                  "%(compute_node)s", {'epc_in_use': epc_used, 'compute_node': compute})
+                  "%(compute_node)s", {'epc_in_use': self.epc_used, 'compute_node': compute.hypervisor_hostname})
 
         if (self.updated and compute.updated_at
                 and self.updated > compute.updated_at):
