@@ -189,6 +189,11 @@ image_fixtures = {
 }
 
 
+def fake_glance_response(data):
+    with mock.patch('glanceclient.common.utils._extract_request_id'):
+        return glanceclient.common.utils.RequestIdProxy([data, None])
+
+
 class ImageV2(dict):
     # Wrapper class that is used to comply with dual nature of
     # warlock objects, that are inherited from dict and have 'schema'
@@ -516,7 +521,8 @@ class TestDownloadNoDirectUri(test.NoDBTestCase):
     @mock.patch('nova.image.glance.GlanceImageServiceV2.show')
     def test_download_no_data_no_dest_path_v2(self, show_mock, open_mock):
         client = mock.MagicMock()
-        client.call.return_value = mock.sentinel.image_chunks
+        client.call.return_value = fake_glance_response(
+            mock.sentinel.image_chunks)
         ctx = mock.sentinel.ctx
         service = glance.GlanceImageServiceV2(client)
         res = service.download(ctx, mock.sentinel.image_id)
@@ -531,7 +537,7 @@ class TestDownloadNoDirectUri(test.NoDBTestCase):
     @mock.patch('nova.image.glance.GlanceImageServiceV2.show')
     def test_download_data_no_dest_path_v2(self, show_mock, open_mock):
         client = mock.MagicMock()
-        client.call.return_value = [1, 2, 3]
+        client.call.return_value = fake_glance_response([1, 2, 3])
         ctx = mock.sentinel.ctx
         data = mock.MagicMock()
         service = glance.GlanceImageServiceV2(client)
@@ -557,7 +563,7 @@ class TestDownloadNoDirectUri(test.NoDBTestCase):
     def test_download_no_data_dest_path_v2(self, fsync_mock, show_mock,
                                            open_mock):
         client = mock.MagicMock()
-        client.call.return_value = [1, 2, 3]
+        client.call.return_value = fake_glance_response([1, 2, 3])
         ctx = mock.sentinel.ctx
         writer = mock.MagicMock()
         open_mock.return_value = writer
@@ -590,7 +596,7 @@ class TestDownloadNoDirectUri(test.NoDBTestCase):
         # #TODO(jaypipes): Fix the aforementioned horrible design of
         # the download() method.
         client = mock.MagicMock()
-        client.call.return_value = [1, 2, 3]
+        client.call.return_value = fake_glance_response([1, 2, 3])
         ctx = mock.sentinel.ctx
         data = mock.MagicMock()
         service = glance.GlanceImageServiceV2(client)
@@ -615,7 +621,7 @@ class TestDownloadNoDirectUri(test.NoDBTestCase):
     def test_download_data_dest_path_write_fails_v2(
             self, show_mock, open_mock):
         client = mock.MagicMock()
-        client.call.return_value = [1, 2, 3]
+        client.call.return_value = fake_glance_response([1, 2, 3])
         ctx = mock.sentinel.ctx
         service = glance.GlanceImageServiceV2(client)
 
@@ -630,6 +636,19 @@ class TestDownloadNoDirectUri(test.NoDBTestCase):
 
         self.assertRaises(FakeDiskException, service.download, ctx,
                           mock.sentinel.image_id, data=Exceptionator())
+
+    @mock.patch.object(six.moves.builtins, 'open')
+    @mock.patch('nova.image.glance.GlanceImageServiceV2.show')
+    def test_download_no_returned_image_data_v2(
+            self, show_mock, open_mock):
+        """Verify images with no data are handled correctly."""
+        client = mock.MagicMock()
+        client.call.return_value = fake_glance_response(None)
+        ctx = mock.sentinel.ctx
+        service = glance.GlanceImageServiceV2(client)
+
+        with testtools.ExpectedException(exception.ImageUnacceptable):
+            service.download(ctx, mock.sentinel.image_id)
 
     @mock.patch('nova.image.glance.GlanceImageServiceV2._get_transfer_module')
     @mock.patch('nova.image.glance.GlanceImageServiceV2.show')
@@ -683,7 +702,7 @@ class TestDownloadNoDirectUri(test.NoDBTestCase):
         tran_mod.download.side_effect = Exception
         get_tran_mock.return_value = tran_mod
         client = mock.MagicMock()
-        client.call.return_value = [1, 2, 3]
+        client.call.return_value = fake_glance_response([1, 2, 3])
         ctx = mock.sentinel.ctx
         writer = mock.MagicMock()
         open_mock.return_value = writer
@@ -736,7 +755,7 @@ class TestDownloadNoDirectUri(test.NoDBTestCase):
         }
         get_tran_mock.return_value = None
         client = mock.MagicMock()
-        client.call.return_value = [1, 2, 3]
+        client.call.return_value = fake_glance_response([1, 2, 3])
         ctx = mock.sentinel.ctx
         writer = mock.MagicMock()
         open_mock.return_value = writer
@@ -799,7 +818,8 @@ class TestDownloadSignatureVerification(test.NoDBTestCase):
         }
         self.fake_img_data = ['A' * 256, 'B' * 256]
         self.client = mock.MagicMock()
-        self.client.call.return_value = self.fake_img_data
+        self.client.call.return_value = fake_glance_response(
+            self.fake_img_data)
 
     @mock.patch('nova.image.glance.LOG')
     @mock.patch('nova.image.glance.GlanceImageServiceV2.show')
@@ -1573,6 +1593,16 @@ class TestDelete(test.NoDBTestCase):
         ctx = mock.sentinel.ctx
         service = glance.GlanceImageServiceV2(client)
         self.assertRaises(exception.ImageNotFound, service.delete, ctx,
+                          mock.sentinel.image_id)
+
+    def test_delete_client_conflict_failure_v2(self):
+        client = mock.MagicMock()
+        fake_details = 'Image %s is in use' % mock.sentinel.image_id
+        client.call.side_effect = glanceclient.exc.HTTPConflict(
+            details=fake_details)
+        ctx = mock.sentinel.ctx
+        service = glance.GlanceImageServiceV2(client)
+        self.assertRaises(exception.ImageDeleteConflict, service.delete, ctx,
                           mock.sentinel.image_id)
 
 

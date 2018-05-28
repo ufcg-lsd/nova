@@ -591,6 +591,24 @@ class MetadataTestCase(test.TestCase):
             self._test_as_json_with_options(is_cells=True,
                                             os_version=os_version)
 
+    @mock.patch('nova.cells.rpcapi.CellsAPI.get_keypair_at_top',
+                side_effect=exception.KeypairNotFound(
+                name='key', user_id='fake_user'))
+    @mock.patch.object(objects.Instance, 'get_by_uuid')
+    def test_as_json_deleted_keypair_in_cells_mode(self,
+                                                   mock_get_keypair_at_top,
+                                                   mock_inst_get_by_uuid):
+        self.flags(enable=True, group='cells')
+        self.flags(cell_type='compute', group='cells')
+
+        instance = self.instance.obj_clone()
+        delattr(instance, 'keypairs')
+        md = fake_InstanceMetadata(self, instance)
+        meta = md._metadata_as_json(base.OPENSTACK_VERSIONS[-1], path=None)
+        meta = jsonutils.loads(meta)
+        self.assertNotIn('keys', meta)
+        self.assertNotIn('public_keys', meta)
+
     @mock.patch.object(objects.Instance, 'get_by_uuid')
     def test_metadata_as_json_deleted_keypair(self, mock_inst_get_by_uuid):
         """Tests that we handle missing instance keypairs.
@@ -1616,6 +1634,20 @@ class MetadataPasswordTestCase(test.TestCase):
         self.mdinst.password = 'foo'
         result = password.handle_password(request, self.mdinst)
         self.assertEqual(result, 'foo')
+
+    @mock.patch.object(objects.InstanceMapping, 'get_by_instance_uuid',
+                       return_value=objects.InstanceMapping(cell_mapping=None))
+    @mock.patch.object(objects.Instance, 'get_by_uuid')
+    def test_set_password_instance_not_found(self, get_by_uuid, get_mapping):
+        """Tests that a 400 is returned if the instance can not be found."""
+        get_by_uuid.side_effect = exception.InstanceNotFound(
+            instance_id=self.instance.uuid)
+        request = webob.Request.blank('')
+        request.method = 'POST'
+        request.val = b'foo'
+        request.content_length = len(request.body)
+        self.assertRaises(webob.exc.HTTPBadRequest, password.handle_password,
+                          request, self.mdinst)
 
     def test_bad_method(self):
         request = webob.Request.blank('')

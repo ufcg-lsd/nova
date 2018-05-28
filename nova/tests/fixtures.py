@@ -418,11 +418,9 @@ class CellDatabases(fixtures.Fixture):
                 # cell_mapping of None. Since we're controlling our
                 # own targeting in this fixture, we need to call this out
                 # specifically and avoid switching global database state
-                try:
-                    with self._real_target_cell(context, cell_mapping) as c:
-                        yield c
-                finally:
-                    return
+                with self._real_target_cell(context, cell_mapping) as c:
+                    yield c
+                return
             ctxt_mgr = self._ctxt_mgrs[cell_mapping.database_connection]
             # This assumes the next local DB access is the same cell that
             # was targeted last time.
@@ -452,6 +450,10 @@ class CellDatabases(fixtures.Fixture):
         # NOTE(melwitt): This is a hack to try to deal with
         # local accesses i.e. non target_cell accesses.
         with self._cell_lock.read_lock():
+            # FIXME(mriedem): This is actually misleading and means we don't
+            # catch things like bug 1717000 where a context should be targeted
+            # to a cell but it's not, and the fixture here just returns the
+            # last targeted context that was used.
             return self._last_ctxt_mgr
 
     def _wrap_get_server(self, target, endpoints, serializer=None):
@@ -1268,12 +1270,17 @@ class CinderFixture(fixtures.Fixture):
     SWAP_ERR_OLD_VOL = '828419fa-3efb-4533-b458-4267ca5fe9b1'
     SWAP_ERR_NEW_VOL = '9c6d9c2d-7a8f-4c80-938d-3bf062b8d489'
 
+    # This represents a bootable image-backed volume to test
+    # boot-from-volume scenarios.
+    IMAGE_BACKED_VOL = '6ca404f3-d844-4169-bb96-bc792f37de98'
+
     def __init__(self, test):
         super(CinderFixture, self).__init__()
         self.test = test
         self.swap_error = False
         self.swap_volume_instance_uuid = None
         self.swap_volume_instance_error_uuid = None
+        self.reserved_volumes = list()
         # This is a map of instance UUIDs mapped to a list of volume IDs.
         # This map gets updated on attach/detach operations.
         self.attachments = collections.defaultdict(list)
@@ -1332,19 +1339,25 @@ class CinderFixture(fixtures.Fixture):
                     break
             else:
                 # This is a test that does not care about the actual details.
+                reserved_volume = (volume_id in self.reserved_volumes)
                 volume = {
-                    'status': 'available',
+                    'status': 'attaching' if reserved_volume else 'available',
                     'display_name': 'TEST2',
                     'attach_status': 'detached',
                     'id': volume_id,
                     'size': 1
                 }
 
-            # update the status based on existing attachments
-            has_attachment = any(
-                [volume['id'] in attachments
-                 for attachments in self.attachments.values()])
-            volume['status'] = 'attached' if has_attachment else 'detached'
+            # Check for our special image-backed volume.
+            if volume_id == self.IMAGE_BACKED_VOL:
+                # Make it a bootable volume.
+                volume['bootable'] = True
+                # Add the image_id metadata.
+                volume['volume_image_metadata'] = {
+                    # There would normally be more image metadata in here...
+                    'image_id': '155d900f-4e14-4e4c-a73d-069cbf4541e6'
+                }
+
             return volume
 
         def fake_initialize_connection(self, context, volume_id, connector):
@@ -1357,7 +1370,16 @@ class CinderFixture(fixtures.Fixture):
                                            new_volume_id, error):
             return {'save_volume_id': new_volume_id}
 
+        def fake_reserve_volume(self_api, context, volume_id):
+            self.reserved_volumes.append(volume_id)
+
         def fake_unreserve_volume(self_api, context, volume_id):
+            # NOTE(mnaser): It's possible that we unreserve a volume that was
+            #               never reserved (ex: instance.volume_attach.error
+            #               notification tests)
+            if volume_id in self.reserved_volumes:
+                self.reserved_volumes.remove(volume_id)
+
             # Signaling that swap_volume has encountered the error
             # from initialize_connection and is working on rolling back
             # the reservation on SWAP_ERR_NEW_VOL.
@@ -1379,6 +1401,12 @@ class CinderFixture(fixtures.Fixture):
 
         def fake_detach(_self, context, volume_id, instance_uuid=None,
                         attachment_id=None):
+            # NOTE(mnaser): It's possible that we unreserve a volume that was
+            #               never reserved (ex: instance.volume_attach.error
+            #               notification tests)
+            if volume_id in self.reserved_volumes:
+                self.reserved_volumes.remove(volume_id)
+
             if instance_uuid is not None:
                 # If the volume isn't attached to this instance it will
                 # result in a ValueError which indicates a broken test or
@@ -1402,7 +1430,7 @@ class CinderFixture(fixtures.Fixture):
             'nova.volume.cinder.API.migrate_volume_completion',
             fake_migrate_volume_completion)
         self.test.stub_out('nova.volume.cinder.API.reserve_volume',
-                           lambda *args, **kwargs: None)
+                           fake_reserve_volume)
         self.test.stub_out('nova.volume.cinder.API.roll_detaching',
                            lambda *args, **kwargs: None)
         self.test.stub_out('nova.volume.cinder.API.terminate_connection',

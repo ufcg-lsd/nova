@@ -140,6 +140,35 @@ class TestResourceProvider(test_objects._LocalTest):
                           objects.ResourceProvider.get_by_uuid,
                           self.context, uuids.missing)
 
+    def test_destroy_with_traits(self):
+        """Test deleting a resource provider that has a trait successfully.
+        """
+        rp = resource_provider.ResourceProvider(self.context,
+                                                uuid=uuids.rp,
+                                                name='fake_rp1')
+        rp.create()
+        custom_trait = resource_provider.Trait(self.context,
+                                               uuid=uuids.trait,
+                                               name='CUSTOM_TRAIT_1')
+        custom_trait.create()
+        rp.set_traits([custom_trait])
+
+        trl = rp.get_traits()
+        self.assertEqual(1, len(trl))
+
+        # Delete a resource provider that has a trait assosiation.
+        rp.destroy()
+
+        # Assert the record has been deleted
+        # in 'resource_provider_traits' table
+        # after Resource Provider object has been destroyed.
+        trl = rp.get_traits()
+        self.assertEqual(0, len(trl))
+        # Assert that NotFound exception is raised.
+        self.assertRaises(exception.NotFound,
+                          resource_provider.ResourceProvider.get_by_uuid,
+                          self.context, uuids.rp)
+
 
 class TestInventoryNoDB(test_objects._LocalTest):
     USES_DB = False
@@ -484,9 +513,13 @@ class TestAllocation(test_objects._LocalTest):
                                  consumer_id=uuids.fake_instance,
                                  used=8)
         alloc_list = objects.AllocationList(self.context, objects=[obj])
-        self.assertNotIn("id", obj)
         alloc_list.create_all()
-        self.assertIn("id", obj)
+
+        rp_al = resource_provider.AllocationList
+        saved_allocations = rp_al.get_all_by_resource_provider_uuid(
+            self.context, rp.uuid)
+        self.assertEqual(1, len(saved_allocations))
+        self.assertEqual(obj.used, saved_allocations[0].used)
 
     def test_create_with_id_fails(self):
         rp = objects.ResourceProvider(context=self.context,

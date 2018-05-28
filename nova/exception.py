@@ -652,6 +652,10 @@ class ImageNotFound(NotFound):
     msg_fmt = _("Image %(image_id)s could not be found.")
 
 
+class ImageDeleteConflict(NovaException):
+    msg_fmt = _("Conflict deleting image. Reason: %(reason)s.")
+
+
 class PreserveEphemeralNotSupported(Invalid):
     msg_fmt = _("The current driver does not support "
                 "preserving ephemeral partitions.")
@@ -2064,6 +2068,14 @@ class ResourceClassNotFound(NotFound):
 
 class ResourceProviderInUse(NovaException):
     msg_fmt = _("Resource provider has allocations.")
+
+
+class ResourceProviderRetrievalFailed(NovaException):
+    msg_fmt = _("Failed to get resource provider with UUID %(uuid)s")
+
+
+class ResourceProviderCreationFailed(NovaException):
+    msg_fmt = _("Failed to create resource provider %(name)s")
 
 
 class InventoryWithResourceClassNotFound(NotFound):

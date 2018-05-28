@@ -66,7 +66,8 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
             mock.patch.object(self.task, '_check_requested_destination',
                               return_value=(mock.sentinel.source_node,
                                             mock.sentinel.dest_node)),
-            mock.patch.object(self.task, '_claim_resources_on_destination'),
+            mock.patch.object(scheduler_utils,
+                              'claim_resources_on_destination'),
             mock.patch.object(self.task.compute_rpcapi, 'live_migration'),
         ) as (mock_check_up, mock_check_dest, mock_claim, mock_mig):
             mock_mig.return_value = "bob"
@@ -75,6 +76,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
             mock_check_up.assert_called_once_with(self.instance_host)
             mock_check_dest.assert_called_once_with()
             mock_claim.assert_called_once_with(
+                self.task.scheduler_client.reportclient, self.instance,
                 mock.sentinel.source_node, mock.sentinel.dest_node)
             mock_mig.assert_called_once_with(
                 self.context,
@@ -302,6 +304,8 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         # Make sure the request_spec was updated to include the cell
         # mapping.
         self.assertIsNotNone(self.fake_spec.requested_destination.cell)
+        # Make sure the spec was updated to include the project_id.
+        self.assertEqual(self.fake_spec.project_id, self.instance.project_id)
 
     def test_find_destination_works_with_no_request_spec(self):
         task = live_migrate.LiveMigrationTask(
@@ -373,7 +377,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
         self.task.scheduler_client.select_destinations(self.context,
                 self.fake_spec, [self.instance.uuid]).AndReturn(
-                        [{'host': 'host1'}])
+                        [{'host': 'host1', 'nodename': 'node1'}])
         self.task._check_compatible_with_source_hypervisor("host1")\
                 .AndRaise(error)
 
@@ -384,7 +388,11 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.task._call_livem_checks_on_host("host2")
 
         self.mox.ReplayAll()
-        self.assertEqual("host2", self.task._find_destination())
+        with mock.patch.object(self.task,
+                               '_remove_host_allocations') as remove_allocs:
+            self.assertEqual("host2", self.task._find_destination())
+        # Should have removed allocations for the first host.
+        remove_allocs.assert_called_once_with('host1', 'node1')
 
     def test_find_destination_retry_with_old_hypervisor(self):
         self._test_find_destination_retry_hypervisor_raises(
@@ -409,7 +417,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
         self.task.scheduler_client.select_destinations(self.context,
                 self.fake_spec, [self.instance.uuid]).AndReturn(
-                        [{'host': 'host1'}])
+                        [{'host': 'host1', 'nodename': 'node1'}])
         self.task._check_compatible_with_source_hypervisor("host1")
         self.task._call_livem_checks_on_host("host1")\
                 .AndRaise(exception.Invalid)
@@ -421,7 +429,11 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.task._call_livem_checks_on_host("host2")
 
         self.mox.ReplayAll()
-        self.assertEqual("host2", self.task._find_destination())
+        with mock.patch.object(self.task,
+                               '_remove_host_allocations') as remove_allocs:
+            self.assertEqual("host2", self.task._find_destination())
+        # Should have removed allocations for the first host.
+        remove_allocs.assert_called_once_with('host1', 'node1')
 
     def test_find_destination_retry_with_failed_migration_pre_checks(self):
         self.flags(migrate_max_retries=1)
@@ -438,7 +450,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
         self.task.scheduler_client.select_destinations(self.context,
                 self.fake_spec, [self.instance.uuid]).AndReturn(
-                        [{'host': 'host1'}])
+                        [{'host': 'host1', 'nodename': 'node1'}])
         self.task._check_compatible_with_source_hypervisor("host1")
         self.task._call_livem_checks_on_host("host1")\
                 .AndRaise(exception.MigrationPreCheckError("reason"))
@@ -450,7 +462,11 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.task._call_livem_checks_on_host("host2")
 
         self.mox.ReplayAll()
-        self.assertEqual("host2", self.task._find_destination())
+        with mock.patch.object(self.task,
+                               '_remove_host_allocations') as remove_allocs:
+            self.assertEqual("host2", self.task._find_destination())
+        # Should have removed allocations for the first host.
+        remove_allocs.assert_called_once_with('host1', 'node1')
 
     def test_find_destination_retry_exceeds_max(self):
         self.flags(migrate_max_retries=0)
@@ -466,16 +482,23 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
         self.task.scheduler_client.select_destinations(self.context,
                 self.fake_spec, [self.instance.uuid]).AndReturn(
-                        [{'host': 'host1'}])
+                        [{'host': 'host1', 'nodename': 'node1'}])
         self.task._check_compatible_with_source_hypervisor("host1")\
                 .AndRaise(exception.DestinationHypervisorTooOld)
 
         self.mox.ReplayAll()
-        with mock.patch.object(self.task.migration, 'save') as save_mock:
+        with test.nested(
+            mock.patch.object(self.task.migration, 'save'),
+            mock.patch.object(self.task, '_remove_host_allocations')
+        ) as (
+            save_mock, remove_allocs
+        ):
             self.assertRaises(exception.MaxRetriesExceeded,
                               self.task._find_destination)
             self.assertEqual('failed', self.task.migration.status)
             save_mock.assert_called_once_with()
+            # Should have removed allocations for the first host.
+            remove_allocs.assert_called_once_with('host1', 'node1')
 
     def test_find_destination_when_runs_out_of_hosts(self):
         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
@@ -517,102 +540,6 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
             self.assertRaises(exception.MigrationPreCheckError,
                 self.task._call_livem_checks_on_host, {})
 
-    def test_claim_resources_on_destination_no_source_allocations(self):
-        """Tests the negative scenario where the instance does not have
-        allocations in Placement on the source compute node so no claim is
-        attempted on the destination compute node.
-        """
-        source_node = objects.ComputeNode(uuid=uuids.source_node)
-        dest_node = objects.ComputeNode(uuid=uuids.dest_node)
-
-        @mock.patch.object(self.task.scheduler_client.reportclient,
-                           'get_allocations_for_instance', return_value={})
-        @mock.patch.object(self.task.scheduler_client.reportclient,
-                           'claim_resources',
-                           new_callable=mock.NonCallableMock)
-        def test(mock_claim, mock_get_allocs):
-            self.task._claim_resources_on_destination(source_node, dest_node)
-            mock_get_allocs.assert_called_once_with(
-                uuids.source_node, self.instance)
-
-        test()
-
-    def test_claim_resources_on_destination_claim_fails(self):
-        """Tests the negative scenario where the resource allocation claim
-        on the destination compute node fails, resulting in an error.
-        """
-        source_node = objects.ComputeNode(uuid=uuids.source_node)
-        dest_node = objects.ComputeNode(uuid=uuids.dest_node)
-        source_res_allocs = {
-            'VCPU': self.instance.vcpus,
-            'MEMORY_MB': self.instance.memory_mb,
-            # This would really include ephemeral and swap too but we're lazy.
-            'DISK_GB': self.instance.root_gb
-        }
-        dest_alloc_request = {
-            'allocations': [
-                {
-                    'resource_provider': {
-                        'uuid': uuids.dest_node
-                    },
-                    'resources': source_res_allocs
-                }
-            ]
-        }
-
-        @mock.patch.object(self.task.scheduler_client.reportclient,
-                           'get_allocations_for_instance',
-                           return_value=source_res_allocs)
-        @mock.patch.object(self.task.scheduler_client.reportclient,
-                           'claim_resources', return_value=False)
-        def test(mock_claim, mock_get_allocs):
-            self.assertRaises(exception.MigrationPreCheckError,
-                              self.task._claim_resources_on_destination,
-                              source_node, dest_node)
-            mock_get_allocs.assert_called_once_with(
-                uuids.source_node, self.instance)
-            mock_claim.assert_called_once_with(
-                self.instance.uuid, dest_alloc_request,
-                self.instance.project_id, self.instance.user_id)
-
-        test()
-
-    def test_claim_resources_on_destination(self):
-        """Happy path test where everything is successful."""
-        source_node = objects.ComputeNode(uuid=uuids.source_node)
-        dest_node = objects.ComputeNode(uuid=uuids.dest_node)
-        source_res_allocs = {
-            'VCPU': self.instance.vcpus,
-            'MEMORY_MB': self.instance.memory_mb,
-            # This would really include ephemeral and swap too but we're lazy.
-            'DISK_GB': self.instance.root_gb
-        }
-        dest_alloc_request = {
-            'allocations': [
-                {
-                    'resource_provider': {
-                        'uuid': uuids.dest_node
-                    },
-                    'resources': source_res_allocs
-                }
-            ]
-        }
-
-        @mock.patch.object(self.task.scheduler_client.reportclient,
-                           'get_allocations_for_instance',
-                           return_value=source_res_allocs)
-        @mock.patch.object(self.task.scheduler_client.reportclient,
-                           'claim_resources', return_value=True)
-        def test(mock_claim, mock_get_allocs):
-            self.task._claim_resources_on_destination(source_node, dest_node)
-            mock_get_allocs.assert_called_once_with(
-                uuids.source_node, self.instance)
-            mock_claim.assert_called_once_with(
-                self.instance.uuid, dest_alloc_request,
-                self.instance.project_id, self.instance.user_id)
-
-        test()
-
     @mock.patch.object(objects.InstanceMapping, 'get_by_instance_uuid',
                        side_effect=exception.InstanceMappingNotFound(
                            uuid=uuids.instance))
@@ -636,3 +563,15 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
                           self.task._get_destination_cell_mapping)
         mock_get.assert_called_once_with(
             self.task.context, self.task.destination)
+
+    @mock.patch.object(objects.ComputeNode, 'get_by_host_and_nodename',
+                       side_effect=exception.ComputeHostNotFound(host='host'))
+    def test_remove_host_allocations_compute_host_not_found(self, get_cn):
+        """Tests that failing to find a ComputeNode will not blow up
+        the _remove_host_allocations method.
+        """
+        with mock.patch.object(
+                self.task.scheduler_client.reportclient,
+                'remove_provider_from_instance_allocation') as remove_provider:
+            self.task._remove_host_allocations('host', 'node')
+        remove_provider.assert_not_called()

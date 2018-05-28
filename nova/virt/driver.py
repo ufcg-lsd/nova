@@ -132,6 +132,13 @@ class ComputeDriver(object):
         "supports_extend_volume": False,
     }
 
+    requires_allocation_refresh = False
+
+    # Indicates if this driver will rebalance nodes among compute service
+    # hosts. This is really here for ironic and should not be used by any
+    # other driver.
+    rebalances_nodes = False
+
     def __init__(self, virtapi):
         self.virtapi = virtapi
         self._compute_event_callback = None
@@ -456,10 +463,11 @@ class ComputeDriver(object):
         """Detach the disk attached to the instance."""
         raise NotImplementedError()
 
-    def swap_volume(self, old_connection_info, new_connection_info,
+    def swap_volume(self, context, old_connection_info, new_connection_info,
                     instance, mountpoint, resize_to):
         """Replace the volume attached to the given `instance`.
 
+        :param context: The request context.
         :param dict old_connection_info:
             The volume for this connection gets detached from the given
             `instance`.
@@ -816,6 +824,7 @@ class ComputeDriver(object):
         :param network_info: instance network information
         :param disk_info: instance disk information
         :param migrate_data: a LiveMigrateData object
+        :returns: migrate_data modified by the driver
         """
         raise NotImplementedError()
 

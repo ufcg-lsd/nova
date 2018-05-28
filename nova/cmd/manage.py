@@ -71,6 +71,7 @@ from oslo_utils import importutils
 from oslo_utils import uuidutils
 import prettytable
 
+import six
 import six.moves.urllib.parse as urlparse
 from sqlalchemy.engine import url as sqla_url
 
@@ -98,6 +99,7 @@ from nova import quota
 from nova import rpc
 from nova import utils
 from nova import version
+from nova.virt import ironic
 
 CONF = nova.conf.CONF
 
@@ -697,24 +699,30 @@ class DbCommands(object):
             except exception.CellMappingNotFound:
                 print(_('WARNING: cell0 mapping not found - not'
                         ' syncing cell0.'))
-            except Exception:
-                print(_('ERROR: could not access cell mapping database - has'
-                        ' api db been created?'))
+            except Exception as e:
+                print(_("""ERROR: Could not access cell0.
+Has the nova_api database been created?
+Has the nova_cell0 database been created?
+Has "nova-manage api_db sync" been run?
+Has "nova-manage cell_v2 map_cell0" been run?
+Is [api_database]/connection set in nova.conf?
+Is the cell0 database connection URL correct?
+Error: %s""") % six.text_type(e))
         return migration.db_sync(version)
 
     def version(self):
         """Print the current database version."""
         print(migration.db_version())
 
-    @args('--max_rows', metavar='<number>', default=1000,
-            help='Maximum number of deleted rows to archive')
+    @args('--max_rows', type=int, metavar='<number>', dest='max_rows',
+          help='Maximum number of deleted rows to archive. Defaults to 1000.')
     @args('--verbose', action='store_true', dest='verbose', default=False,
           help='Print how many rows were archived per table.')
     @args('--until-complete', action='store_true', dest='until_complete',
           default=False,
           help=('Run continuously until all deleted rows are archived. Use '
                 'max_rows as a batch size for each iteration.'))
-    def archive_deleted_rows(self, max_rows, verbose=False,
+    def archive_deleted_rows(self, max_rows=1000, verbose=False,
                              until_complete=False):
         """Move deleted rows from production tables to shadow tables.
 
@@ -854,6 +862,102 @@ class DbCommands(object):
         print(t)
 
         return ran and 1 or 0
+
+    @args('--resource_class', metavar='<class>', required=True,
+          help='Ironic node class to set on instances')
+    @args('--host', metavar='<host>', required=False,
+          help='Compute service name to migrate nodes on')
+    @args('--node', metavar='<node>', required=False,
+          help='Ironic node UUID to migrate (all on the host if omitted)')
+    @args('--all', action='store_true', default=False, dest='all_hosts',
+          help='Run migrations for all ironic hosts and nodes')
+    @args('--verbose', action='store_true', default=False,
+          help='Print information about migrations being performed')
+    def ironic_flavor_migration(self, resource_class, host=None, node=None,
+                                all_hosts=False, verbose=False):
+        """Migrate flavor information for ironic instances.
+
+        This will manually push the instance flavor migration required
+        for ironic-hosted instances in Pike. The best way to accomplish
+        this migration is to run your ironic computes normally in Pike.
+        However, if you need to push the migration manually, then use
+        this.
+
+        This is idempotent, but not trivial to start/stop/resume. It is
+        recommended that you do this with care and not from a script
+        assuming it is trivial.
+
+        Running with --all may generate a large amount of DB traffic
+        all at once. Running at least one host at a time is recommended
+        for batching.
+
+        Return values:
+
+        0: All work is completed (or none is needed)
+        1: Specified host and/or node is not found, or no ironic nodes present
+        2: Internal accounting error shows more than one instance per node
+        3: Invalid combination of required arguments
+        """
+        if not resource_class:
+            # Note that if --resource_class is not specified on the command
+            # line it will actually result in a return code of 2, but we
+            # leave 3 here for testing purposes.
+            print(_('A resource_class is required for all modes of operation'))
+            return 3
+
+        ctx = context.get_admin_context()
+
+        if all_hosts:
+            if host or node:
+                print(_('--all with --host and/or --node does not make sense'))
+                return 3
+            cns = objects.ComputeNodeList.get_by_hypervisor_type(ctx, 'ironic')
+        elif host and node:
+            try:
+                cn = objects.ComputeNode.get_by_host_and_nodename(ctx, host,
+                                                                  node)
+                cns = [cn]
+            except exception.ComputeHostNotFound:
+                cns = []
+        elif host:
+            try:
+                cns = objects.ComputeNodeList.get_all_by_host(ctx, host)
+            except exception.ComputeHostNotFound:
+                cns = []
+        else:
+            print(_('Either --all, --host, or --host and --node are required'))
+            return 3
+
+        if len(cns) == 0:
+            print(_('No ironic compute nodes found that match criteria'))
+            return 1
+
+        # Check that we at least got one ironic compute and we can pretty
+        # safely assume the rest are
+        if cns[0].hypervisor_type != 'ironic':
+            print(_('Compute node(s) specified is not of type ironic'))
+            return 1
+
+        for cn in cns:
+            # NOTE(danms): The instance.node is the
+            # ComputeNode.hypervisor_hostname, which in the case of ironic is
+            # the node uuid. Since only one instance can be on a node in
+            # ironic, do another sanity check here to make sure we look legit.
+            inst = objects.InstanceList.get_by_filters(
+                ctx, {'node': cn.hypervisor_hostname,
+                      'deleted': False})
+            if len(inst) > 1:
+                print(_('Ironic node %s has multiple instances? '
+                        'Something is wrong.') % cn.hypervisor_hostname)
+                return 2
+            elif len(inst) == 1:
+                result = ironic.IronicDriver._pike_flavor_migration_for_node(
+                    ctx, resource_class, inst[0].uuid)
+                if result and verbose:
+                    print(_('Migrated instance %(uuid)s on node %(node)s') % {
+                        'uuid': inst[0].uuid,
+                        'node': cn.hypervisor_hostname})
+        return 0
 
 
 class ApiDbCommands(object):
@@ -1275,10 +1379,11 @@ class CellV2Commands(object):
             marker = instances[-1].uuid
         return marker
 
-    @args('--cell_uuid', metavar='<cell_uuid>', required=True,
-            help='Unmigrated instances will be mapped to the cell with the '
-                 'uuid provided.')
-    @args('--max-count', metavar='<max_count>',
+    @args('--cell_uuid', metavar='<cell_uuid>', dest='cell_uuid',
+          required=True,
+          help='Unmigrated instances will be mapped to the cell with the '
+               'uuid provided.')
+    @args('--max-count', metavar='<max_count>', dest='max_count',
           help='Maximum number of instances to map')
     def map_instances(self, cell_uuid, max_count=None):
         """Map instances into the provided cell.
@@ -1462,7 +1567,11 @@ class CellV2Commands(object):
           help=_('Considered successful (exit code 0) only when an unmapped '
                  'host is discovered. Any other outcome will be considered a '
                  'failure (exit code 1).'))
-    def discover_hosts(self, cell_uuid=None, verbose=False, strict=False):
+    @args('--by-service', action='store_true', default=False,
+          dest='by_service',
+          help=_('Discover hosts by service instead of compute node'))
+    def discover_hosts(self, cell_uuid=None, verbose=False, strict=False,
+                       by_service=False):
         """Searches cells, or a single cell, and maps found hosts.
 
         When a new host is added to a deployment it will add a service entry
@@ -1475,7 +1584,8 @@ class CellV2Commands(object):
                 print(msg)
 
         ctxt = context.RequestContext()
-        hosts = host_mapping_obj.discover_hosts(ctxt, cell_uuid, status_fn)
+        hosts = host_mapping_obj.discover_hosts(ctxt, cell_uuid, status_fn,
+                                                by_service)
         # discover_hosts will return an empty list if no hosts are discovered
         if strict:
             return int(not hosts)
@@ -1550,15 +1660,26 @@ class CellV2Commands(object):
         print(t)
         return 0
 
+    @args('--force', action='store_true', default=False,
+          help=_('Delete hosts that belong to the cell as well.'))
     @args('--cell_uuid', metavar='<cell_uuid>', dest='cell_uuid',
           required=True, help=_('The uuid of the cell to delete.'))
-    def delete_cell(self, cell_uuid):
+    def delete_cell(self, cell_uuid, force=False):
         """Delete an empty cell by the given uuid.
 
-        If the cell is not found by uuid or it is not empty (it has host or
-        instance mappings) this command will return a non-zero exit code.
+        This command will return a non-zero exit code in the following cases.
 
-        Returns 0 if the empty cell is found and deleted successfully.
+        * The cell is not found by uuid.
+        * It has hosts and force is False.
+        * It has instance mappings.
+
+        If force is True and the cell has host, hosts are deleted as well.
+
+        Returns 0 in the following cases.
+
+        * The empty cell is found and deleted successfully.
+        * The cell has hosts and force is True and the cell and the hosts are
+          deleted successfully.
         """
         ctxt = context.get_admin_context()
         # Find the CellMapping given the uuid.
@@ -1571,7 +1692,7 @@ class CellV2Commands(object):
         # Check to see if there are any HostMappings for this cell.
         host_mappings = objects.HostMappingList.get_by_cell_id(
             ctxt, cell_mapping.id)
-        if host_mappings:
+        if host_mappings and not force:
             print(_('There are existing hosts mapped to cell with uuid %s.') %
                   cell_uuid)
             return 2
@@ -1583,6 +1704,10 @@ class CellV2Commands(object):
             print(_('There are existing instances mapped to cell with '
                     'uuid %s.') % cell_uuid)
             return 3
+
+        # Delete hosts mapped to the cell.
+        for host_mapping in host_mappings:
+            host_mapping.destroy()
 
         # There are no hosts or instances mapped to the cell so delete it.
         cell_mapping.destroy()
@@ -1635,6 +1760,57 @@ class CellV2Commands(object):
             print(_('Unable to update CellMapping: %s') % e)
             return 2
 
+        return 0
+
+    @args('--cell_uuid', metavar='<cell_uuid>', dest='cell_uuid',
+          required=True, help=_('The uuid of the cell.'))
+    @args('--host', metavar='<host>', dest='host',
+          required=True, help=_('The host to delete.'))
+    def delete_host(self, cell_uuid, host):
+        """Delete a host in a cell (host mappings) by the given host name
+
+        This command will return a non-zero exit code in the following cases.
+
+        * The cell is not found by uuid.
+        * The host is not found by host name.
+        * The host is not in the cell.
+        * The host has instances.
+
+        Returns 0 if the host is deleted successfully.
+        """
+        ctxt = context.get_admin_context()
+        # Find the CellMapping given the uuid.
+        try:
+            cell_mapping = objects.CellMapping.get_by_uuid(ctxt, cell_uuid)
+        except exception.CellMappingNotFound:
+            print(_('Cell with uuid %s was not found.') % cell_uuid)
+            return 1
+
+        try:
+            host_mapping = objects.HostMapping.get_by_host(ctxt, host)
+        except exception.HostMappingNotFound:
+            print(_('The host %s was not found.') % host)
+            return 2
+
+        if host_mapping.cell_mapping.uuid != cell_mapping.uuid:
+            print(_('The host %(host)s was not found '
+                    'in the cell %(cell_uuid)s.') % {'host': host,
+                                                     'cell_uuid': cell_uuid})
+            return 3
+
+        with context.target_cell(ctxt, cell_mapping) as cctxt:
+            instances = objects.InstanceList.get_by_host(cctxt, host)
+            nodes = objects.ComputeNodeList.get_all_by_host(cctxt, host)
+
+        if instances:
+            print(_('There are instances on the host %s.') % host)
+            return 4
+
+        for node in nodes:
+            node.mapped = 0
+            node.save()
+
+        host_mapping.destroy()
         return 0
 
 

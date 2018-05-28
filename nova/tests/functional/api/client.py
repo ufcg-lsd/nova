@@ -285,6 +285,14 @@ class TestOpenStackClient(object):
     def delete_server(self, server_id):
         return self.api_delete('/servers/%s' % server_id)
 
+    def force_down_service(self, host, binary, forced_down):
+        req = {
+            "host": host,
+            "binary": binary,
+            "forced_down": forced_down
+        }
+        return self.api_put('/os-services/force-down', req).body['service']
+
     def get_image(self, image_id):
         return self.api_get('/images/%s' % image_id).body['image']
 
@@ -297,6 +305,16 @@ class TestOpenStackClient(object):
 
     def delete_image(self, image_id):
         return self.api_delete('/images/%s' % image_id)
+
+    def put_image_meta_key(self, image_id, key, value):
+        """Creates or updates a given image metadata key/value pair."""
+        req_body = {
+            'meta': {
+                key: value
+            }
+        }
+        return self.api_put('/images/%s/metadata/%s' % (image_id, key),
+                            req_body)
 
     def get_flavor(self, flavor_id):
         return self.api_get('/flavors/%s' % flavor_id).body['flavor']
@@ -443,3 +461,15 @@ class TestOpenStackClient(object):
     def get_active_migrations(self, server_id):
         return self.api_get('/servers/%s/migrations' %
                             server_id).body['migrations']
+
+    def get_migrations(self):
+        return self.api_get('os-migrations').body['migrations']
+
+    def force_complete_migration(self, server_id, migration_id):
+        return self.api_post(
+            '/servers/%s/migrations/%s/action' % (server_id, migration_id),
+            {'force_complete': None})
+
+    def delete_migration(self, server_id, migration_id):
+        return self.api_delete(
+            '/servers/%s/migrations/%s' % (server_id, migration_id))

@@ -47,6 +47,7 @@ from nova.pci import manager as pci_manager
 from nova.pci import utils as pci_utils
 from nova.pci import whitelist as pci_whitelist
 from nova import policy
+from nova import service_auth
 from nova import test
 from nova.tests.unit import fake_instance
 from nova.tests import uuidsentinel as uuids
@@ -121,6 +122,7 @@ class TestNeutronClient(test.NoDBTestCase):
     def setUp(self):
         super(TestNeutronClient, self).setUp()
         neutronapi.reset_state()
+        self.addCleanup(service_auth.reset_globals)
 
     def test_withtoken(self):
         self.flags(url='http://anyhost/', group='neutron')
@@ -141,7 +143,8 @@ class TestNeutronClient(test.NoDBTestCase):
                           neutronapi.get_client,
                           my_context)
 
-    def test_non_admin_with_service_token(self):
+    @mock.patch.object(ks_loading, 'load_auth_from_conf_options')
+    def test_non_admin_with_service_token(self, mock_load):
         self.flags(send_service_user_token=True, group='service_user')
 
         my_context = context.RequestContext('userid',
@@ -181,9 +184,10 @@ class TestNeutronClient(test.NoDBTestCase):
                                             auth_token='token',
                                             is_admin=False)
         client = neutronapi.get_client(my_context)
-        self.assertRaises(
+        exc = self.assertRaises(
             exception.Forbidden,
             client.create_port)
+        self.assertIsInstance(exc.format_message(), six.text_type)
 
     def test_withtoken_context_is_admin(self):
         self.flags(url='http://anyhost/', group='neutron')
@@ -3004,8 +3008,11 @@ class TestNeutronv2(TestNeutronv2Base):
             self.assertEqual(requested_ports[index].get('binding:vif_details'),
                              nw_info.get('details'))
             self.assertEqual(
-                    requested_ports[index].get(neutronapi.BINDING_PROFILE),
-                    nw_info.get('profile'))
+                # If the requested port does not define a binding:profile, or
+                # has it set to None, we default to an empty dict to avoid
+                # NoneType errors.
+                requested_ports[index].get(neutronapi.BINDING_PROFILE) or {},
+                nw_info.get('profile'))
             index += 1
 
         self.assertFalse(nw_infos[0]['active'])
@@ -3923,6 +3930,31 @@ class TestNeutronv2WithMock(test.TestCase):
                                          'fake_profile': 'fake_data'}}})
 
     @mock.patch.object(neutronapi, 'get_client', return_value=mock.Mock())
+    def test_update_port_bindings_for_instance_binding_profile_none(
+        self, get_client_mock):
+        """Tests _update_port_binding_for_instance when the binding:profile
+        value is None.
+        """
+        instance = fake_instance.fake_instance_obj(self.context)
+        self.api._has_port_binding_extension = mock.Mock(return_value=True)
+
+        fake_ports = {'ports': [
+                        {'id': uuids.portid,
+                         neutronapi.BINDING_PROFILE: None,
+                         neutronapi.BINDING_HOST_ID: instance.host}]}
+        list_ports_mock = mock.Mock(return_value=fake_ports)
+        get_client_mock.return_value.list_ports = list_ports_mock
+        update_port_mock = mock.Mock()
+        get_client_mock.return_value.update_port = update_port_mock
+
+        self.api._update_port_binding_for_instance(self.context, instance,
+                                                   'my-host')
+        # Assert that update_port was called on the port with a
+        # different host but with no binding profile.
+        update_port_mock.assert_called_once_with(
+            uuids.portid, {'port': {neutronapi.BINDING_HOST_ID: 'my-host'}})
+
+    @mock.patch.object(neutronapi, 'get_client', return_value=mock.Mock())
     def test_update_port_bindings_for_instance_same_host(self,
                                                          get_client_mock):
         instance = fake_instance.fake_instance_obj(self.context)
@@ -4174,6 +4206,38 @@ class TestNeutronv2WithMock(test.TestCase):
                                         instance,
                                         host='my-new-host',
                                         teardown=False)
+        update_port_mock.assert_called_once_with(
+            uuids.port_id,
+            port_data)
+
+    @mock.patch.object(neutronapi, 'get_client', return_value=mock.Mock())
+    def test_update_port_profile_for_migration_teardown_false_none_profile(
+        self, get_client_mock):
+        """Tests setup_networks_on_host when migrating the port to the
+        destination host and the binding:profile is None in the port.
+        """
+        instance = fake_instance.fake_instance_obj(self.context)
+        self.api._has_port_binding_extension = mock.Mock(return_value=True)
+        # We test with an instance host and destination_host where the
+        # port will be moving but with binding:profile set to None.
+        get_ports = {
+            'ports': [
+                {'id': uuids.port_id,
+                 neutronapi.BINDING_HOST_ID: instance.host,
+                 neutronapi.BINDING_PROFILE: None}
+            ]
+        }
+        self.api.list_ports = mock.Mock(return_value=get_ports)
+        update_port_mock = mock.Mock()
+        get_client_mock.return_value.update_port = update_port_mock
+        migrate_profile = {neutronapi.MIGRATING_ATTR: 'my-new-host'}
+        port_data = {
+            'port': {
+                neutronapi.BINDING_PROFILE: migrate_profile
+            }
+        }
+        self.api.setup_networks_on_host(
+            self.context, instance, host='my-new-host', teardown=False)
         update_port_mock.assert_called_once_with(
             uuids.port_id,
             port_data)

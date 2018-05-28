@@ -30,6 +30,7 @@ from nova.i18n import _
 from nova import rpc
 from nova.scheduler import client
 from nova.scheduler import driver
+from nova.scheduler import utils
 
 CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
@@ -78,7 +79,12 @@ class FilterScheduler(driver.Scheduler):
             context, 'scheduler.select_destinations.start',
             dict(request_spec=spec_obj.to_legacy_request_spec_dict()))
 
-        num_instances = spec_obj.num_instances
+        # NOTE(sbauza): The RequestSpec.num_instances field contains the number
+        # of instances created when the RequestSpec was used to first boot some
+        # instances. This is incorrect when doing a move or resize operation,
+        # so prefer the length of instance_uuids unless it is None.
+        num_instances = (len(instance_uuids) if instance_uuids
+                         else spec_obj.num_instances)
         selected_hosts = self._schedule(context, spec_obj, instance_uuids,
             alloc_reqs_by_rp_uuid, provider_summaries)
 
@@ -145,7 +151,7 @@ class FilterScheduler(driver.Scheduler):
         # host, we virtually consume resources on it so subsequent
         # selections can adjust accordingly.
 
-        # Note: remember, we are using an iterator here. So only
+        # Note: remember, we are using a generator-iterator here. So only
         # traverse this list once. This can bite you if the hosts
         # are being scanned in a filter or weighing function.
         hosts = self._get_all_host_states(elevated, spec_obj,
@@ -266,6 +272,15 @@ class FilterScheduler(driver.Scheduler):
                            PUT /allocations/{consumer_uuid} call to claim
                            resources for the instance
         """
+
+        if utils.request_is_rebuild(spec_obj):
+            # NOTE(danms): This is a rebuild-only scheduling request, so we
+            # should not be doing any extra claiming
+            LOG.debug('Not claiming resources in the placement API for '
+                      'rebuild-only scheduling of instance %(uuid)s',
+                      {'uuid': instance_uuid})
+            return True
+
         LOG.debug("Attempting to claim resources in the placement API for "
                   "instance %s", instance_uuid)
 
@@ -321,10 +336,14 @@ class FilterScheduler(driver.Scheduler):
 
     def _get_all_host_states(self, context, spec_obj, provider_summaries):
         """Template method, so a subclass can implement caching."""
-        # NOTE(jaypipes): None is treated differently from an empty dict. We
-        # pass None when we want to grab all compute nodes (for instance, when
-        # using the caching scheduler. We pass an empty dict when the Placement
-        # API found no providers that match the requested constraints.
+        # NOTE(jaypipes): provider_summaries being None is treated differently
+        # from an empty dict. provider_summaries is None when we want to grab
+        # all compute nodes, for instance when using the caching scheduler.
+        # The provider_summaries variable will be an empty dict when the
+        # Placement API found no providers that match the requested
+        # constraints, which in turn makes compute_uuids an empty list and
+        # get_host_states_by_uuids will return an empty generator-iterator
+        # also, which will eventually result in a NoValidHost error.
         compute_uuids = None
         if provider_summaries is not None:
             compute_uuids = list(provider_summaries.keys())

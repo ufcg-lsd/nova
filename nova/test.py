@@ -60,6 +60,7 @@ from nova.tests.unit import conf_fixture
 from nova.tests.unit import policy_fixture
 from nova.tests import uuidsentinel as uuids
 from nova import utils
+from nova.virt import images
 
 
 CONF = cfg.CONF
@@ -208,6 +209,9 @@ class TestCase(testtools.TestCase):
     USES_DB_SELF = False
     REQUIRES_LOCKING = False
 
+    # Setting to True makes the test use the RPCFixture.
+    STUB_RPC = True
+
     # The number of non-cell0 cells to create. This is only used in the
     # base class when USES_DB is True.
     NUMBER_OF_CELLS = 1
@@ -249,7 +253,9 @@ class TestCase(testtools.TestCase):
                                 group='oslo_concurrency')
 
         self.useFixture(conf_fixture.ConfFixture(CONF))
-        self.useFixture(nova_fixtures.RPCFixture('nova.test'))
+
+        if self.STUB_RPC:
+            self.useFixture(nova_fixtures.RPCFixture('nova.test'))
 
         # we cannot set this in the ConfFixture as oslo only registers the
         # notification opts at the first instantiation of a Notifier that
@@ -302,6 +308,8 @@ class TestCase(testtools.TestCase):
 
         # Reset the traits sync flag
         objects.resource_provider._TRAITS_SYNCED = False
+        # Reset the global QEMU version flag.
+        images.QEMU_VERSION = None
 
         mox_fixture = self.useFixture(moxstubout.MoxStubout())
         self.mox = mox_fixture.mox
@@ -401,7 +409,9 @@ class TestCase(testtools.TestCase):
                                      cell_mapping=cell)
             hm.create()
             self.host_mappings[hm.host] = hm
-
+            if host is not None:
+                # Make sure that CONF.host is relevant to the right hostname
+                self.useFixture(nova_fixtures.ConfPatcher(host=host))
         svc = self.useFixture(
             nova_fixtures.ServiceFixture(name, host, **kwargs))
 

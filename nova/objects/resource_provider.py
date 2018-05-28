@@ -70,6 +70,7 @@ def _ensure_rc_cache(ctx):
     _RC_CACHE = rc_cache.ResourceClassCache(ctx)
 
 
+@oslo_db_api.wrap_db_retry(max_retries=5, retry_on_deadlock=True)
 @db_api.api_context_manager.writer
 def _trait_sync(ctx):
     """Sync the os_traits symbols to the database.
@@ -505,6 +506,10 @@ class ResourceProvider(base.NovaObject):
         RPA_model = models.ResourceProviderAggregate
         context.session.query(RPA_model).\
                 filter(RPA_model.resource_provider_id == _id).delete()
+        # delete any trait associations for the resource provider
+        RPT_model = models.ResourceProviderTrait
+        context.session.query(RPT_model).\
+                filter(RPT_model.resource_provider_id == _id).delete()
         # Now delete the RP records
         result = context.session.query(models.ResourceProvider).\
                  filter(models.ResourceProvider.id == _id).delete()
@@ -1845,8 +1850,7 @@ class AllocationList(base.ObjectListBase, base.NovaObject):
                         resource_class_id=rc_id,
                         consumer_id=alloc.consumer_id,
                         used=alloc.used)
-                result = conn.execute(ins_stmt)
-                alloc.id = result.lastrowid
+                conn.execute(ins_stmt)
 
             # Generation checking happens here. If the inventory for
             # this resource provider changed out from under us,
@@ -2620,6 +2624,7 @@ class AllocationCandidates(base.NovaObject):
                     resource_requests=resource_requests,
                 )
                 alloc_request_objs.append(req_obj)
+                continue
 
             has_none = len(local_resources) == 0
             if has_none:

@@ -365,7 +365,6 @@ class HostManager(object):
 
     def __init__(self):
         self.cells = None
-        self.host_state_map = {}
         self.filter_handler = filters.HostFilterHandler()
         filter_classes = self.filter_handler.get_matching_classes(
                 CONF.filter_scheduler.available_filters)
@@ -601,8 +600,13 @@ class HostManager(object):
                 _match_forced_hosts(name_to_cls_map, force_hosts)
             if force_nodes:
                 _match_forced_nodes(name_to_cls_map, force_nodes)
-            if force_hosts or force_nodes:
-                # NOTE(deva): Skip filters when forcing host or node
+            check_type = ('scheduler_hints' in spec_obj and
+                          spec_obj.scheduler_hints.get('_nova_check_type'))
+            if not check_type and (force_hosts or force_nodes):
+                # NOTE(deva,dansmith): Skip filters when forcing host or node
+                # unless we've declared the internal check type flag, in which
+                # case we're asking for a specific host and for filtering to
+                # be done.
                 if name_to_cls_map:
                     return name_to_cls_map.values()
                 else:
@@ -619,6 +623,14 @@ class HostManager(object):
 
     def _get_computes_for_cells(self, context, cells, compute_uuids=None):
         """Get a tuple of compute node and service information.
+
+        :param context: request context
+        :param cells: list of CellMapping objects
+        :param compute_uuids: list of ComputeNode UUIDs. If this is None, all
+            compute nodes from each specified cell will be returned, otherwise
+            only the ComputeNode objects with a UUID in the list of UUIDs in
+            any given cell is returned. If this is an empty list, the returned
+            compute_nodes tuple item will be an empty dict.
 
         Returns a tuple (compute_nodes, services) where:
          - compute_nodes is cell-uuid keyed dict of compute node lists
@@ -673,7 +685,7 @@ class HostManager(object):
         return self._get_host_states(context, compute_nodes, services)
 
     def get_all_host_states(self, context):
-        """Returns a list of HostStates that represents all the hosts
+        """Returns a generator of HostStates that represents all the hosts
         the HostManager knows about. Also, each of the consumable resources
         in HostState are pre-populated and adjusted based on data in the db.
         """
@@ -683,11 +695,12 @@ class HostManager(object):
         return self._get_host_states(context, compute_nodes, services)
 
     def _get_host_states(self, context, compute_nodes, services):
-        """Returns a tuple of HostStates given a list of computes.
+        """Returns a generator over HostStates given a list of computes.
 
         Also updates the HostStates internal mapping for the HostManager.
         """
         # Get resource usage across the available compute nodes:
+        host_state_map = {}
         seen_nodes = set()
         for cell_uuid, computes in compute_nodes.items():
             for compute in computes:
@@ -701,12 +714,12 @@ class HostManager(object):
                 host = compute.host
                 node = compute.hypervisor_hostname
                 state_key = (host, node)
-                host_state = self.host_state_map.get(state_key)
+                host_state = host_state_map.get(state_key)
                 if not host_state:
                     host_state = self.host_state_cls(host, node,
                                                      cell_uuid,
                                                      compute=compute)
-                    self.host_state_map[state_key] = host_state
+                    host_state_map[state_key] = host_state
                 # We force to update the aggregates info each time a
                 # new request comes in, because some changes on the
                 # aggregates could have been happening after setting
@@ -718,15 +731,7 @@ class HostManager(object):
 
                 seen_nodes.add(state_key)
 
-        # remove compute nodes from host_state_map if they are not active
-        dead_nodes = set(self.host_state_map.keys()) - seen_nodes
-        for state_key in dead_nodes:
-            host, node = state_key
-            LOG.info(_LI("Removing dead compute node %(host)s:%(node)s "
-                         "from scheduler"), {'host': host, 'node': node})
-            del self.host_state_map[state_key]
-
-        return (self.host_state_map[host] for host in seen_nodes)
+        return (host_state_map[host] for host in seen_nodes)
 
     def _get_aggregates_info(self, host):
         return [self.aggs_by_id[agg_id] for agg_id in

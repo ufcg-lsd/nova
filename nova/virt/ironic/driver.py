@@ -135,6 +135,15 @@ class IronicDriver(virt_driver.ComputeDriver):
                     "supports_attach_interface": True
                     }
 
+    # Needed for exiting instances to have allocations for custom resource
+    # class resources
+    # TODO(johngarbutt) we should remove this once the resource class
+    # migration has been completed.
+    requires_allocation_refresh = True
+
+    # This driver is capable of rebalancing nodes between computes.
+    rebalances_nodes = True
+
     def __init__(self, virtapi, read_only=False):
         super(IronicDriver, self).__init__(virtapi)
         global ironic
@@ -152,7 +161,6 @@ class IronicDriver(virt_driver.ComputeDriver):
         self.node_cache = {}
         self.node_cache_time = 0
         self.servicegroup_api = servicegroup.API()
-        self._refresh_hash_ring(nova_context.get_admin_context())
 
         self.ironicclient = client_wrapper.IronicClientWrapper()
 
@@ -508,7 +516,22 @@ class IronicDriver(virt_driver.ComputeDriver):
         :param host: the hostname of the compute host.
 
         """
-        return
+        self._refresh_hash_ring(nova_context.get_admin_context())
+
+    @staticmethod
+    def _pike_flavor_migration_for_node(ctx, node_rc, instance_uuid):
+        normalized_rc = obj_fields.ResourceClass.normalize_name(node_rc)
+        instance = objects.Instance.get_by_uuid(ctx, instance_uuid,
+                                                expected_attrs=["flavor"])
+        specs = instance.flavor.extra_specs
+        resource_key = "resources:%s" % normalized_rc
+        if resource_key in specs:
+            # The compute must have been restarted, and the instance.flavor
+            # has already been migrated
+            return False
+        specs[resource_key] = "1"
+        instance.save()
+        return True
 
     def _pike_flavor_migration(self, node_uuids):
         """This code is needed in Pike to prevent problems where an operator
@@ -536,21 +559,12 @@ class IronicDriver(virt_driver.ComputeDriver):
                 continue
             if node.instance_uuid in self._migrated_instance_uuids:
                 continue
-            normalized_rc = obj_fields.ResourceClass.normalize_name(node_rc)
-            instance = objects.Instance.get_by_uuid(ctx, node.instance_uuid,
-                    expected_attrs=["flavor"])
-            specs = instance.flavor.extra_specs
-            resource_key = "resources:%s" % normalized_rc
+            self._pike_flavor_migration_for_node(ctx, node_rc,
+                                                 node.instance_uuid)
             self._migrated_instance_uuids.add(node.instance_uuid)
-            if resource_key in specs:
-                # The compute must have been restarted, and the instance.flavor
-                # has already been migrated
-                continue
-            specs[resource_key] = "1"
-            instance.save()
             LOG.debug("The flavor extra_specs for Ironic instance %(inst)s "
                       "have been updated for custom resource class '%(rc)s'.",
-                      {"inst": instance.uuid, "rc": node_rc})
+                      {"inst": node.instance_uuid, "rc": node_rc})
         return
 
     def _get_hypervisor_type(self):
@@ -739,16 +753,14 @@ class IronicDriver(virt_driver.ComputeDriver):
         the supplied node.
         """
         node = self._node_from_cache(nodename)
-        info = self._node_resource(node)
         # TODO(jaypipes): Completely remove the reporting of VCPU, MEMORY_MB,
         # and DISK_GB resource classes in early Queens when Ironic nodes will
         # *always* return the custom resource class that represents the
         # baremetal node class in an atomic, singular unit.
-        if info['vcpus'] == 0:
-            # NOTE(jaypipes): The driver can return 0-valued vcpus when the
-            # node is "disabled".  In the future, we should detach inventory
-            # accounting from the concept of a node being disabled or not. The
-            # two things don't really have anything to do with each other.
+        if (not self._node_resources_used(node) and
+            self._node_resources_unavailable(node)):
+            # TODO(dtantsur): report resources as reserved instead of reporting
+            # an empty inventory
             LOG.debug('Node %(node)s is not ready for a deployment, '
                       'reporting an empty inventory for it. Node\'s '
                       'provision state is %(prov)s, power state is '
@@ -757,32 +769,23 @@ class IronicDriver(virt_driver.ComputeDriver):
                        'power': node.power_state, 'maint': node.maintenance})
             return {}
 
-        result = {
-            obj_fields.ResourceClass.VCPU: {
-                'total': info['vcpus'],
-                'reserved': 0,
-                'min_unit': 1,
-                'max_unit': info['vcpus'],
-                'step_size': 1,
-                'allocation_ratio': 1.0,
-            },
-            obj_fields.ResourceClass.MEMORY_MB: {
-                'total': info['memory_mb'],
-                'reserved': 0,
-                'min_unit': 1,
-                'max_unit': info['memory_mb'],
-                'step_size': 1,
-                'allocation_ratio': 1.0,
-            },
-            obj_fields.ResourceClass.DISK_GB: {
-                'total': info['local_gb'],
-                'reserved': 0,
-                'min_unit': 1,
-                'max_unit': info['local_gb'],
-                'step_size': 1,
-                'allocation_ratio': 1.0,
-            },
-        }
+        info = self._node_resource(node)
+        result = {}
+        for rc, field in [(obj_fields.ResourceClass.VCPU, 'vcpus'),
+                          (obj_fields.ResourceClass.MEMORY_MB, 'memory_mb'),
+                          (obj_fields.ResourceClass.DISK_GB, 'local_gb')]:
+            # NOTE(dtantsur): any of these fields can be zero starting with
+            # the Pike release.
+            if info[field]:
+                result[rc] = {
+                    'total': info[field],
+                    'reserved': 0,
+                    'min_unit': 1,
+                    'max_unit': info[field],
+                    'step_size': 1,
+                    'allocation_ratio': 1.0,
+                }
+
         rc_name = info.get('resource_class')
         if rc_name is not None:
             # TODO(jaypipes): Raise an exception in Queens if Ironic doesn't

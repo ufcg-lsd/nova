@@ -21,9 +21,10 @@ import mock
 from oslo_log import log as logging
 from oslo_serialization import base64
 from oslo_utils import timeutils
+import six
 
 from nova.compute import api as compute_api
-from nova.compute import manager as compute_manager
+from nova.compute import instance_actions
 from nova.compute import rpcapi
 from nova import context
 from nova import exception
@@ -36,6 +37,7 @@ from nova.tests.functional import integrated_helpers
 from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit import fake_block_device
 from nova.tests.unit import fake_network
+from nova.tests.unit import fake_notifier
 import nova.tests.unit.image.fake
 from nova.tests.unit import policy_fixture
 from nova.virt import fake
@@ -1057,28 +1059,212 @@ class ServerTestV220(ServersTestBase):
         self._delete_server(server_id)
 
 
-class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
-    """Tests moving servers while checking the resource allocations and usages
+class ServerRebuildTestCase(integrated_helpers._IntegratedTestBase,
+                            integrated_helpers.InstanceHelperMixin):
+    api_major_version = 'v2.1'
+    # We have to cap the microversion at 2.38 because that's the max we
+    # can use to update image metadata via our compute images proxy API.
+    microversion = '2.38'
 
-    These tests use two compute hosts. Boot a server on one of them then try to
-    move the server to the other. At every step resource allocation of the
-    server and the resource usages of the computes are queried from placement
-    API and asserted.
+    # We need the ImagePropertiesFilter so override the base class setup
+    # which configures to use the chance_scheduler.
+    def _setup_scheduler_service(self):
+        return self.start_service('scheduler')
+
+    def _disable_compute_for(self, server):
+        # Refresh to get its host
+        server = self.api.get_server(server['id'])
+        host = server['OS-EXT-SRV-ATTR:host']
+
+        # Disable the service it is on
+        self.api_fixture.admin_api.put_service('disable',
+                                               {'host': host,
+                                                'binary': 'nova-compute'})
+
+    def test_rebuild_with_image_novalidhost(self):
+        """Creates a server with an image that is valid for the single compute
+        that we have. Then rebuilds the server, passing in an image with
+        metadata that does not fit the single compute which should result in
+        a NoValidHost error. The ImagePropertiesFilter filter is enabled by
+        default so that should filter out the host based on the image meta.
+        """
+
+        fake.set_nodes(['host2'])
+        self.addCleanup(fake.restore_nodes)
+        self.flags(host='host2')
+        self.compute2 = self.start_service('compute', host='host2')
+
+        # We hard-code from a fake image since we can't get images
+        # via the compute /images proxy API with microversion > 2.35.
+        original_image_ref = '155d900f-4e14-4e4c-a73d-069cbf4541e6'
+        server_req_body = {
+            'server': {
+                'imageRef': original_image_ref,
+                'flavorRef': '1',   # m1.tiny from DefaultFlavorsFixture,
+                'name': 'test_rebuild_with_image_novalidhost',
+                # We don't care about networking for this test. This requires
+                # microversion >= 2.37.
+                'networks': 'none'
+            }
+        }
+        server = self.api.post_server(server_req_body)
+        self._wait_for_state_change(self.api, server, 'ACTIVE')
+
+        # Disable the host we're on so ComputeFilter would have ruled it out
+        # normally
+        self._disable_compute_for(server)
+
+        # Now update the image metadata to be something that won't work with
+        # the fake compute driver we're using since the fake driver has an
+        # "x86_64" architecture.
+        rebuild_image_ref = (
+            nova.tests.unit.image.fake.AUTO_DISK_CONFIG_ENABLED_IMAGE_UUID)
+        self.api.put_image_meta_key(
+            rebuild_image_ref, 'hw_architecture', 'unicore32')
+        # Now rebuild the server with that updated image and it should result
+        # in a NoValidHost failure from the scheduler.
+        rebuild_req_body = {
+            'rebuild': {
+                'imageRef': rebuild_image_ref
+            }
+        }
+        # Since we're using the CastAsCall fixture, the NoValidHost error
+        # should actually come back to the API and result in a 500 error.
+        # Normally the user would get a 202 response because nova-api RPC casts
+        # to nova-conductor which RPC calls the scheduler which raises the
+        # NoValidHost. We can mimic the end user way to figure out the failure
+        # by looking for the failed 'rebuild' instance action event.
+        self.api.api_post('/servers/%s/action' % server['id'],
+                          rebuild_req_body, check_response_status=[500])
+        # Look for the failed rebuild action.
+        self._wait_for_action_fail_completion(
+            server, instance_actions.REBUILD, 'rebuild_server',
+            # Before microversion 2.51 events are only returned for instance
+            # actions if you're an admin.
+            self.api_fixture.admin_api)
+        # Assert the server image_ref was rolled back on failure.
+        server = self.api.get_server(server['id'])
+        self.assertEqual(original_image_ref, server['image']['id'])
+
+        # The server should be in ERROR state
+        self.assertEqual('ERROR', server['status'])
+        self.assertIn('No valid host', server['fault']['message'])
+
+        # Rebuild it again with the same bad image to make sure it's rejected
+        # again. Since we're using CastAsCall here, there is no 202 from the
+        # API, and the exception from conductor gets passed back through the
+        # API.
+        ex = self.assertRaises(
+            client.OpenStackApiException, self.api.api_post,
+            '/servers/%s/action' % server['id'], rebuild_req_body)
+        self.assertIn('NoValidHost', six.text_type(ex))
+
+    # A rebuild to the same host should never attempt a rebuild claim.
+    @mock.patch('nova.compute.resource_tracker.ResourceTracker.rebuild_claim',
+                new_callable=mock.NonCallableMock)
+    def test_rebuild_with_new_image(self, mock_rebuild_claim):
+        """Rebuilds a server with a different image which will run it through
+        the scheduler to validate the image is still OK with the compute host
+        that the instance is running on.
+
+        Validates that additional resources are not allocated against the
+        instance.host in Placement due to the rebuild on same host.
+        """
+        admin_api = self.api_fixture.admin_api
+        admin_api.microversion = '2.53'
+
+        def _get_provider_uuid():
+            resp = admin_api.api_get('os-hypervisors').body
+            self.assertEqual(1, len(resp['hypervisors']))
+            return resp['hypervisors'][0]['id']
+
+        def _get_provider_usages(provider_uuid):
+            return self.placement_api.get(
+                '/resource_providers/%s/usages' % provider_uuid).body['usages']
+
+        def _get_allocations_by_server_uuid(server_uuid):
+            return self.placement_api.get(
+                '/allocations/%s' % server_uuid).body['allocations']
+
+        def assertFlavorMatchesAllocation(flavor, allocation):
+            self.assertEqual(flavor['vcpus'], allocation['VCPU'])
+            self.assertEqual(flavor['ram'], allocation['MEMORY_MB'])
+            self.assertEqual(flavor['disk'], allocation['DISK_GB'])
+
+        rp_uuid = _get_provider_uuid()
+        # make sure we start with no usage on the compute node
+        rp_usages = _get_provider_usages(rp_uuid)
+        self.assertEqual({'VCPU': 0, 'MEMORY_MB': 0, 'DISK_GB': 0}, rp_usages)
+
+        server_req_body = {
+            'server': {
+                # We hard-code from a fake image since we can't get images
+                # via the compute /images proxy API with microversion > 2.35.
+                'imageRef': '155d900f-4e14-4e4c-a73d-069cbf4541e6',
+                'flavorRef': '1',   # m1.tiny from DefaultFlavorsFixture,
+                'name': 'test_rebuild_with_new_image',
+                # We don't care about networking for this test. This requires
+                # microversion >= 2.37.
+                'networks': 'none'
+            }
+        }
+        server = self.api.post_server(server_req_body)
+        self._wait_for_state_change(self.api, server, 'ACTIVE')
+
+        flavor = self.api.api_get('/flavors/1').body['flavor']
+
+        # There should be usage for the server on the compute node now.
+        rp_usages = _get_provider_usages(rp_uuid)
+        assertFlavorMatchesAllocation(flavor, rp_usages)
+        allocs = _get_allocations_by_server_uuid(server['id'])
+        self.assertIn(rp_uuid, allocs)
+        allocs = allocs[rp_uuid]['resources']
+        assertFlavorMatchesAllocation(flavor, allocs)
+
+        rebuild_image_ref = (
+            nova.tests.unit.image.fake.AUTO_DISK_CONFIG_ENABLED_IMAGE_UUID)
+        # Now rebuild the server with a different image.
+        rebuild_req_body = {
+            'rebuild': {
+                'imageRef': rebuild_image_ref
+            }
+        }
+        self.api.api_post('/servers/%s/action' % server['id'],
+                          rebuild_req_body)
+        self._wait_for_server_parameter(
+            self.api, server, {'OS-EXT-STS:task_state': None})
+
+        # The usage and allocations should not have changed.
+        rp_usages = _get_provider_usages(rp_uuid)
+        assertFlavorMatchesAllocation(flavor, rp_usages)
+
+        allocs = _get_allocations_by_server_uuid(server['id'])
+        self.assertIn(rp_uuid, allocs)
+        allocs = allocs[rp_uuid]['resources']
+        assertFlavorMatchesAllocation(flavor, allocs)
+
+
+class ProviderUsageBaseTestCase(test.TestCase,
+                                integrated_helpers.InstanceHelperMixin):
+    """Base test class for functional tests that check provider usage
+    and consumer allocations in Placement during various operations.
+
+    Subclasses must define a **compute_driver** attribute for the virt driver
+    to use.
+
+    This class sets up standard fixtures and controller services but does not
+    start any compute services, that is left to the subclass.
     """
 
-    REQUIRES_LOCKING = True
     microversion = 'latest'
 
     _enabled_filters = ['RetryFilter', 'ComputeFilter']
 
     def setUp(self):
-        # NOTE(danms): The test defaults to using SmallFakeDriver,
-        # which only has one vcpu, which can't take the doubled allocation
-        # we're now giving it. So, use the bigger MediumFakeDriver here.
-        self.flags(compute_driver='fake.MediumFakeDriver')
+        self.flags(compute_driver=self.compute_driver)
         self.flags(enabled_filters=self._enabled_filters,
                    group='filter_scheduler')
-        super(ServerMovingTests, self).setUp()
+        super(ProviderUsageBaseTestCase, self).setUp()
 
         self.useFixture(policy_fixture.RealPolicyFixture())
         self.useFixture(nova_fixtures.NeutronFixture(self))
@@ -1091,10 +1277,6 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
 
         self.admin_api = api_fixture.admin_api
         self.admin_api.microversion = self.microversion
-
-        # NOTE(danms): We need admin_api so we can direct builds to
-        # specific compute nodes. We're not doing anything in these tests
-        # that should be affected by admin-ness, so this should be okay.
         self.api = self.admin_api
 
         # the image fake backend needed for image discovery
@@ -1104,6 +1286,56 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
         self.start_service('scheduler')
 
         self.addCleanup(nova.tests.unit.image.fake.FakeImageService_reset)
+        fake_network.set_stub_network_methods(self)
+
+    def _get_provider_uuid_by_host(self, host):
+        # NOTE(gibi): the compute node id is the same as the compute node
+        # provider uuid on that compute
+        resp = self.admin_api.api_get(
+            'os-hypervisors?hypervisor_hostname_pattern=%s' % host).body
+        return resp['hypervisors'][0]['id']
+
+    def _get_provider_usages(self, provider_uuid):
+        return self.placement_api.get(
+            '/resource_providers/%s/usages' % provider_uuid).body['usages']
+
+    def _get_allocations_by_server_uuid(self, server_uuid):
+        return self.placement_api.get(
+            '/allocations/%s' % server_uuid).body['allocations']
+
+    def assertFlavorMatchesAllocation(self, flavor, allocation):
+        self.assertEqual(flavor['vcpus'], allocation['VCPU'])
+        self.assertEqual(flavor['ram'], allocation['MEMORY_MB'])
+        self.assertEqual(flavor['disk'], allocation['DISK_GB'])
+
+    def assertFlavorsMatchAllocation(self, old_flavor, new_flavor, allocation):
+        self.assertEqual(old_flavor['vcpus'] + new_flavor['vcpus'],
+                         allocation['VCPU'])
+        self.assertEqual(old_flavor['ram'] + new_flavor['ram'],
+                         allocation['MEMORY_MB'])
+        self.assertEqual(old_flavor['disk'] + new_flavor['disk'],
+                         allocation['DISK_GB'])
+
+
+class ServerMovingTests(ProviderUsageBaseTestCase):
+    """Tests moving servers while checking the resource allocations and usages
+
+    These tests use two compute hosts. Boot a server on one of them then try to
+    move the server to the other. At every step resource allocation of the
+    server and the resource usages of the computes are queried from placement
+    API and asserted.
+    """
+
+    REQUIRES_LOCKING = True
+    # NOTE(danms): The test defaults to using SmallFakeDriver,
+    # which only has one vcpu, which can't take the doubled allocation
+    # we're now giving it. So, use the bigger MediumFakeDriver here.
+    compute_driver = 'fake.MediumFakeDriver'
+
+    def setUp(self):
+        super(ServerMovingTests, self).setUp()
+        fake_notifier.stub_notifier(self)
+        self.addCleanup(fake_notifier.reset)
 
         fake.set_nodes(['host1'])
         self.flags(host='host1')
@@ -1115,7 +1347,6 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
         self.addCleanup(fake.restore_nodes)
         self.flags(host='host2')
         self.compute2 = self.start_service('compute', host='host2')
-        fake_network.set_stub_network_methods(self)
 
         flavors = self.api.get_flavors()
         self.flavor1 = flavors[0]
@@ -1135,21 +1366,6 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
         other_host = {'host1': 'host2',
                       'host2': 'host1'}
         return other_host[host]
-
-    def _get_provider_uuid_by_host(self, host):
-        # NOTE(gibi): the compute node id is the same as the compute node
-        # provider uuid on that compute
-        resp = self.admin_api.api_get(
-            'os-hypervisors?hypervisor_hostname_pattern=%s' % host).body
-        return resp['hypervisors'][0]['id']
-
-    def _get_provider_usages(self, provider_uuid):
-        return self.placement_api.get(
-            '/resource_providers/%s/usages' % provider_uuid).body['usages']
-
-    def _get_allocations_by_server_uuid(self, server_uuid):
-        return self.placement_api.get(
-            '/allocations/%s' % server_uuid).body['allocations']
 
     def _run_periodics(self):
         # NOTE(jaypipes): We always run periodics in the same order: first on
@@ -1179,19 +1395,6 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
 
     def test_resize_confirm_reverse(self):
         self._test_resize_confirm(dest_hostname='host2')
-
-    def assertFlavorMatchesAllocation(self, flavor, allocation):
-        self.assertEqual(flavor['vcpus'], allocation['VCPU'])
-        self.assertEqual(flavor['ram'], allocation['MEMORY_MB'])
-        self.assertEqual(flavor['disk'], allocation['DISK_GB'])
-
-    def assertFlavorsMatchAllocation(self, old_flavor, new_flavor, allocation):
-        self.assertEqual(old_flavor['vcpus'] + new_flavor['vcpus'],
-                         allocation['VCPU'])
-        self.assertEqual(old_flavor['ram'] + new_flavor['ram'],
-                         allocation['MEMORY_MB'])
-        self.assertEqual(old_flavor['disk'] + new_flavor['disk'],
-                         allocation['DISK_GB'])
 
     def _boot_and_check_allocations(self, flavor, source_hostname):
         server_req = self._build_minimal_create_server_request(
@@ -1315,6 +1518,12 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
         # Check usages after delete
         self.api.delete_server(server['id'])
         self._wait_until_deleted(server)
+        # NOTE(gibi): The resource allocation is deleted after the instance is
+        # destroyed in the db so wait_until_deleted might return before the
+        # the resource are deleted in placement. So we need to wait for the
+        # instance.delete.end notification as that is emitted after the
+        # resources are freed.
+        fake_notifier.wait_for_versioned_notification('instance.delete.end')
 
         source_usages = self._get_provider_usages(source_rp_uuid)
         self.assertEqual({'VCPU': 0,
@@ -1594,6 +1803,20 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
         self._delete_and_check_allocations(
             server, source_rp_uuid, dest_rp_uuid)
 
+    def _restart_compute_service(self, compute):
+        # NOTE(gibi): The service interface cannot be used to simulate a real
+        # service restart as the manager object will not be recreated after a
+        # service.stop() and service.start() therefore the manager state will
+        # survive. For example the resource tracker will not be recreated after
+        # a stop start. The service.kill() call cannot help as it deletes
+        # the service from the DB which is unrealistic and causes that some
+        # operation that refers to the killed host (e.g. evacuate) fails.
+        # So this helper method tries to simulate a better compute service
+        # restart by cleaning up some of the internal state of the compute
+        # manager.
+        compute.manager._resource_tracker = None
+        compute.start()
+
     def test_evacuate(self):
         source_hostname = self.compute1.host
         dest_hostname = self.compute2.host
@@ -1637,7 +1860,8 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
         self.assertFlavorMatchesAllocation(self.flavor1, dest_allocation)
 
         # start up the source compute
-        self.compute1.start()
+        self._restart_compute_service(self.compute1)
+
         self.admin_api.put_service(
             source_compute_id, {'forced_down': 'false'})
 
@@ -1657,6 +1881,238 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
 
         self._delete_and_check_allocations(
             server, source_rp_uuid, dest_rp_uuid)
+
+    def test_evacuate_forced_host(self):
+        """Evacuating a server with a forced host bypasses the scheduler
+        which means conductor has to create the allocations against the
+        destination node. This test recreates the scenarios and asserts
+        the allocations on the source and destination nodes are as expected.
+        """
+        source_hostname = self.compute1.host
+        dest_hostname = self.compute2.host
+
+        server = self._boot_and_check_allocations(
+            self.flavor1, source_hostname)
+
+        source_compute_id = self.admin_api.get_services(
+            host=source_hostname, binary='nova-compute')[0]['id']
+
+        self.compute1.stop()
+        # force it down to avoid waiting for the service group to time out
+        self.admin_api.put_service(
+            source_compute_id, {'forced_down': 'true'})
+
+        # evacuate the server and force the destination host which bypasses
+        # the scheduler
+        post = {
+            'evacuate': {
+                'host': dest_hostname,
+                'force': True
+            }
+        }
+        self.api.post_server_action(server['id'], post)
+        expected_params = {'OS-EXT-SRV-ATTR:host': dest_hostname,
+                           'status': 'ACTIVE'}
+        server = self._wait_for_server_parameter(self.api, server,
+                                                 expected_params)
+
+        # Run the periodics to show those don't modify allocations.
+        self._run_periodics()
+
+        # Expect to have allocation and usages on both computes as the
+        # source compute is still down
+        source_rp_uuid = self._get_provider_uuid_by_host(source_hostname)
+        dest_rp_uuid = self._get_provider_uuid_by_host(dest_hostname)
+
+        source_usages = self._get_provider_usages(source_rp_uuid)
+        self.assertFlavorMatchesAllocation(self.flavor1, source_usages)
+
+        dest_usages = self._get_provider_usages(dest_rp_uuid)
+        self.assertFlavorMatchesAllocation(self.flavor1, dest_usages)
+
+        allocations = self._get_allocations_by_server_uuid(server['id'])
+        self.assertEqual(2, len(allocations))
+        source_allocation = allocations[source_rp_uuid]['resources']
+        self.assertFlavorMatchesAllocation(self.flavor1, source_allocation)
+        dest_allocation = allocations[dest_rp_uuid]['resources']
+        self.assertFlavorMatchesAllocation(self.flavor1, dest_allocation)
+
+        # start up the source compute
+        self.compute1.start()
+        self.admin_api.put_service(
+            source_compute_id, {'forced_down': 'false'})
+
+        # Run the periodics again to show they don't change anything.
+        self._run_periodics()
+
+        # When the source node starts up, the instance has moved so the
+        # ResourceTracker should cleanup allocations for the source node.
+        source_usages = self._get_provider_usages(source_rp_uuid)
+        self.assertEqual(
+            {'VCPU': 0, 'MEMORY_MB': 0, 'DISK_GB': 0}, source_usages)
+
+        # The usages/allocations should still exist on the destination node
+        # after the source node starts back up.
+        dest_usages = self._get_provider_usages(dest_rp_uuid)
+        self.assertFlavorMatchesAllocation(self.flavor1, dest_usages)
+
+        allocations = self._get_allocations_by_server_uuid(server['id'])
+        self.assertEqual(1, len(allocations))
+        dest_allocation = allocations[dest_rp_uuid]['resources']
+        self.assertFlavorMatchesAllocation(self.flavor1, dest_allocation)
+
+        self._delete_and_check_allocations(
+            server, source_rp_uuid, dest_rp_uuid)
+
+    def test_evacuate_claim_on_dest_fails(self):
+        """Tests that the allocations on the destination node are cleaned up
+        when the rebuild move claim fails due to insufficient resources.
+        """
+        source_hostname = self.compute1.host
+        dest_hostname = self.compute2.host
+        dest_rp_uuid = self._get_provider_uuid_by_host(dest_hostname)
+
+        server = self._boot_and_check_allocations(
+            self.flavor1, source_hostname)
+
+        source_compute_id = self.admin_api.get_services(
+            host=source_hostname, binary='nova-compute')[0]['id']
+
+        self.compute1.stop()
+        # force it down to avoid waiting for the service group to time out
+        self.admin_api.put_service(
+            source_compute_id, {'forced_down': 'true'})
+
+        # NOTE(mriedem): This isn't great, and I'd like to fake out the driver
+        # to make the claim fail, by doing something like returning a too high
+        # memory_mb overhead, but the limits dict passed to the claim is empty
+        # so the claim test is considering it as unlimited and never actually
+        # performs a claim test. Configuring the scheduler to use the RamFilter
+        # to get the memory_mb limit at least seems like it should work but
+        # it doesn't appear to for some reason...
+        def fake_move_claim(*args, **kwargs):
+            # Assert the destination node allocation exists.
+            dest_usages = self._get_provider_usages(dest_rp_uuid)
+            self.assertFlavorMatchesAllocation(self.flavor1, dest_usages)
+            raise exception.ComputeResourcesUnavailable(
+                    reason='test_evacuate_claim_on_dest_fails')
+
+        with mock.patch('nova.compute.claims.MoveClaim', fake_move_claim):
+            # evacuate the server
+            self.api.post_server_action(server['id'], {'evacuate': {}})
+            # the migration will fail on the dest node and the instance will
+            # go into error state
+            server = self._wait_for_state_change(self.api, server, 'ERROR')
+
+        # Run the periodics to show those don't modify allocations.
+        self._run_periodics()
+
+        # The allocation should still exist on the source node since it's
+        # still down, and the allocation on the destination node should be
+        # cleaned up.
+        source_rp_uuid = self._get_provider_uuid_by_host(source_hostname)
+
+        source_usages = self._get_provider_usages(source_rp_uuid)
+        self.assertFlavorMatchesAllocation(self.flavor1, source_usages)
+
+        dest_usages = self._get_provider_usages(dest_rp_uuid)
+        self.assertFlavorMatchesAllocation(
+            {'vcpus': 0, 'ram': 0, 'disk': 0}, dest_usages)
+
+        allocations = self._get_allocations_by_server_uuid(server['id'])
+        self.assertEqual(1, len(allocations))
+        source_allocation = allocations[source_rp_uuid]['resources']
+        self.assertFlavorMatchesAllocation(self.flavor1, source_allocation)
+
+        # start up the source compute
+        self.compute1.start()
+        self.admin_api.put_service(
+            source_compute_id, {'forced_down': 'false'})
+
+        # Run the periodics again to show they don't change anything.
+        self._run_periodics()
+
+        # The source compute shouldn't have cleaned up the allocation for
+        # itself since the instance didn't move.
+        source_usages = self._get_provider_usages(source_rp_uuid)
+        self.assertFlavorMatchesAllocation(self.flavor1, source_usages)
+
+        allocations = self._get_allocations_by_server_uuid(server['id'])
+        self.assertEqual(1, len(allocations))
+        source_allocation = allocations[source_rp_uuid]['resources']
+        self.assertFlavorMatchesAllocation(self.flavor1, source_allocation)
+
+    def test_evacuate_rebuild_on_dest_fails(self):
+        """Tests that the allocations on the destination node are cleaned up
+        by the drop_move_claim in the ResourceTracker automatically when
+        the claim is made but the actual rebuild via the driver fails.
+        """
+        source_hostname = self.compute1.host
+        dest_hostname = self.compute2.host
+        dest_rp_uuid = self._get_provider_uuid_by_host(dest_hostname)
+
+        server = self._boot_and_check_allocations(
+            self.flavor1, source_hostname)
+
+        source_compute_id = self.admin_api.get_services(
+            host=source_hostname, binary='nova-compute')[0]['id']
+
+        self.compute1.stop()
+        # force it down to avoid waiting for the service group to time out
+        self.admin_api.put_service(
+            source_compute_id, {'forced_down': 'true'})
+
+        def fake_rebuild(*args, **kwargs):
+            # Assert the destination node allocation exists.
+            dest_usages = self._get_provider_usages(dest_rp_uuid)
+            self.assertFlavorMatchesAllocation(self.flavor1, dest_usages)
+            raise test.TestingException('test_evacuate_rebuild_on_dest_fails')
+
+        with mock.patch.object(
+                self.compute2.driver, 'rebuild', fake_rebuild):
+            # evacuate the server
+            self.api.post_server_action(server['id'], {'evacuate': {}})
+            # the migration will fail on the dest node and the instance will
+            # go into error state
+            server = self._wait_for_state_change(self.api, server, 'ERROR')
+
+        # Run the periodics to show those don't modify allocations.
+        self._run_periodics()
+
+        # The allocation should still exist on the source node since it's
+        # still down, and the allocation on the destination node should be
+        # cleaned up.
+        source_rp_uuid = self._get_provider_uuid_by_host(source_hostname)
+
+        source_usages = self._get_provider_usages(source_rp_uuid)
+        self.assertFlavorMatchesAllocation(self.flavor1, source_usages)
+
+        dest_usages = self._get_provider_usages(dest_rp_uuid)
+        self.assertFlavorMatchesAllocation(
+            {'vcpus': 0, 'ram': 0, 'disk': 0}, dest_usages)
+
+        allocations = self._get_allocations_by_server_uuid(server['id'])
+        self.assertEqual(1, len(allocations))
+        source_allocation = allocations[source_rp_uuid]['resources']
+        self.assertFlavorMatchesAllocation(self.flavor1, source_allocation)
+
+        # start up the source compute
+        self.compute1.start()
+        self.admin_api.put_service(
+            source_compute_id, {'forced_down': 'false'})
+
+        # Run the periodics again to show they don't change anything.
+        self._run_periodics()
+
+        # The source compute shouldn't have cleaned up the allocation for
+        # itself since the instance didn't move.
+        source_usages = self._get_provider_usages(source_rp_uuid)
+        self.assertFlavorMatchesAllocation(self.flavor1, source_usages)
+
+        allocations = self._get_allocations_by_server_uuid(server['id'])
+        self.assertEqual(1, len(allocations))
+        source_allocation = allocations[source_rp_uuid]['resources']
+        self.assertFlavorMatchesAllocation(self.flavor1, source_allocation)
 
     def _boot_then_shelve_and_check_allocations(self, hostname, rp_uuid):
         # avoid automatic shelve offloading
@@ -1711,7 +2167,9 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
             'shelveOffload': {}
         }
         self.api.post_server_action(server['id'], req)
-        self._wait_for_state_change(self.api, server, 'SHELVED_OFFLOADED')
+        self._wait_for_server_parameter(
+            self.api, server, {'status': 'SHELVED_OFFLOADED',
+                               'OS-EXT-SRV-ATTR:host': None})
         source_usages = self._get_provider_usages(source_rp_uuid)
         self.assertEqual({'VCPU': 0,
                           'MEMORY_MB': 0,
@@ -1879,113 +2337,138 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
         self._delete_and_check_allocations(
             server, source_rp_uuid, dest_rp_uuid)
 
-    def test_rescheduling_when_booting_instance(self):
+    def test_live_migrate_pre_check_fails(self):
+        """Tests the case that the LiveMigrationTask in conductor has
+        called the scheduler which picked a host and created allocations
+        against it in Placement, but then when the conductor task calls
+        check_can_live_migrate_destination on the destination compute it
+        fails. The allocations on the destination compute node should be
+        cleaned up before the conductor task asks the scheduler for another
+        host to try the live migration.
+        """
         self.failed_hostname = None
-        old_build_resources = (compute_manager.ComputeManager.
-            _build_resources)
-
-        def fake_build_resources(sl, *args, **kwargs):
-            # We failed on the first scheduling
-            if not self.failed_hostname:
-                self.failed_hostname = sl.host
-                raise Exception()
-
-            return old_build_resources(sl, *args, **kwargs)
-
-        self.stub_out('nova.compute.manager.ComputeManager._build_resources',
-                      fake_build_resources)
-
-        server_req = self._build_minimal_create_server_request(
-                self.api, 'some-server', flavor_id=self.flavor1['id'],
-                image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
-                networks=[])
-
-        created_server = self.api.post_server({'server': server_req})
-        server = self._wait_for_state_change(
-                self.admin_api, created_server, 'ACTIVE')
-        dest_hostname = server['OS-EXT-SRV-ATTR:host']
-
-        LOG.info('failed on %s', self.failed_hostname)
-        LOG.info('booting on %s', dest_hostname)
-
-        failed_rp_uuid = self._get_provider_uuid_by_host(self.failed_hostname)
+        source_hostname = self.compute1.host
+        dest_hostname = self.compute2.host
+        source_rp_uuid = self._get_provider_uuid_by_host(source_hostname)
         dest_rp_uuid = self._get_provider_uuid_by_host(dest_hostname)
 
-        failed_usages = self._get_provider_usages(failed_rp_uuid)
-        # Expects no allocation records on the failed host.
-        self.assertFlavorMatchesAllocation(
-           {'vcpus': 0, 'ram': 0, 'disk': 0}, failed_usages)
+        server = self._boot_and_check_allocations(
+            self.flavor1, source_hostname)
 
-        # Ensure the allocation records on the destination host.
+        def fake_check_can_live_migrate_destination(
+                context, instance, src_compute_info, dst_compute_info,
+                block_migration=False, disk_over_commit=False):
+            self.failed_hostname = dst_compute_info['host']
+            raise exception.MigrationPreCheckError(
+                reason='test_live_migrate_pre_check_fails')
+
+        with mock.patch('nova.virt.fake.FakeDriver.'
+                        'check_can_live_migrate_destination',
+                        side_effect=fake_check_can_live_migrate_destination):
+            post = {
+                'os-migrateLive': {
+                    'host': dest_hostname,
+                    'block_migration': True,
+                }
+            }
+            self.api.post_server_action(server['id'], post)
+            # As there are only two computes and we failed to live migrate to
+            # the only other destination host, the LiveMigrationTask raises
+            # MaxRetriesExceeded back to the conductor manager which handles it
+            # generically and sets the instance back to ACTIVE status and
+            # clears the task_state. The migration record status is set to
+            # 'error', so that's what we need to look for to know when this
+            # is done.
+            migration = self._wait_for_migration_status(server, 'error')
+
+        # The source_compute should be set on the migration record, but the
+        # destination shouldn't be as we never made it to one.
+        self.assertEqual(source_hostname, migration['source_compute'])
+        self.assertIsNone(migration['dest_compute'])
+        # Make sure the destination host (the only other host) is the failed
+        # host.
+        self.assertEqual(dest_hostname, self.failed_hostname)
+
+        source_usages = self._get_provider_usages(source_rp_uuid)
+        # Since the instance didn't move, assert the allocations are still
+        # on the source node.
+        self.assertFlavorMatchesAllocation(self.flavor1, source_usages)
+
         dest_usages = self._get_provider_usages(dest_rp_uuid)
-        self.assertFlavorMatchesAllocation(self.flavor1, dest_usages)
-
-    def test_abort_when_booting_instance(self):
-        self.failed_hostname = None
-        old_build_resources = (compute_manager.ComputeManager.
-            _build_resources)
-
-        def fake_build_resources(sl, *args, **kwargs):
-            # We failed on the first scheduling
-            if not self.failed_hostname:
-                self.failed_hostname = sl.host
-                raise exception.BuildAbortException(instance_uuid='fake_uuid',
-                    reason='just abort')
-
-            return old_build_resources(sl, *args, **kwargs)
-
-        self.stub_out('nova.compute.manager.ComputeManager._build_resources',
-                      fake_build_resources)
-
-        server_req = self._build_minimal_create_server_request(
-                self.api, 'some-server', flavor_id=self.flavor1['id'],
-                image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
-                networks=[])
-
-        created_server = self.api.post_server({'server': server_req})
-        self._wait_for_state_change(self.admin_api, created_server, 'ERROR')
-
-        LOG.info('failed on %s', self.failed_hostname)
-
-        failed_rp_uuid = self._get_provider_uuid_by_host(self.failed_hostname)
-        failed_usages = self._get_provider_usages(failed_rp_uuid)
-        # Expects no allocation records on the failed host.
+        # Assert the allocations, created by the scheduler, are cleaned up
+        # after the migration pre-check error happens.
         self.assertFlavorMatchesAllocation(
-           {'vcpus': 0, 'ram': 0, 'disk': 0}, failed_usages)
+            {'vcpus': 0, 'ram': 0, 'disk': 0}, dest_usages)
 
-    def _wait_for_prep_resize_fail_completion(self, server, expected_action):
-        """Polls instance action events for the given instance and action
-        until it finds the compute_prep_resize action event with an error
-        result.
+        allocations = self._get_allocations_by_server_uuid(server['id'])
+        # There should only be 1 allocation for the instance on the source node
+        self.assertEqual(1, len(allocations))
+        self.assertIn(source_rp_uuid, allocations)
+        self.assertFlavorMatchesAllocation(
+            self.flavor1, allocations[source_rp_uuid]['resources'])
+
+        self._delete_and_check_allocations(
+            server, source_rp_uuid, dest_rp_uuid)
+
+    @mock.patch('nova.virt.fake.FakeDriver.pre_live_migration',
+                # The actual type of exception here doesn't matter. The point
+                # is that the virt driver raised an exception from the
+                # pre_live_migration method on the destination host.
+                side_effect=test.TestingException(
+                    'test_live_migrate_rollback_cleans_dest_node_allocations'))
+    def test_live_migrate_rollback_cleans_dest_node_allocations(
+            self, mock_pre_live_migration):
+        """Tests the case that when live migration fails, either during the
+        call to pre_live_migration on the destination, or during the actual
+        live migration in the virt driver, the allocations on the destination
+        node are rolled back since the instance is still on the source node.
         """
-        completion_event = None
-        for attempt in range(10):
-            actions = self.api.get_instance_actions(server['id'])
-            # Look for the migrate action.
-            for action in actions:
-                if action['action'] == expected_action:
-                    events = (
-                        self.api.api_get(
-                            '/servers/%s/os-instance-actions/%s' %
-                            (server['id'], action['request_id'])
-                        ).body['instanceAction']['events'])
-                    # Look for the compute_prep_resize being in error state.
-                    for event in events:
-                        if (event['event'] == 'compute_prep_resize' and
-                                event['result'] is not None and
-                                event['result'].lower() == 'error'):
-                            completion_event = event
-                            # Break out of the events loop.
-                            break
-                    if completion_event:
-                        # Break out of the actions loop.
-                        break
-            # We didn't find the completion event yet, so wait a bit.
-            time.sleep(0.5)
+        source_hostname = self.compute1.host
+        dest_hostname = self.compute2.host
+        source_rp_uuid = self._get_provider_uuid_by_host(source_hostname)
+        dest_rp_uuid = self._get_provider_uuid_by_host(dest_hostname)
 
-        if completion_event is None:
-            self.fail('Timed out waiting for compute_prep_resize failure '
-                      'event. Current instance actions: %s' % actions)
+        server = self._boot_and_check_allocations(
+            self.flavor1, source_hostname)
+
+        post = {
+            'os-migrateLive': {
+                'host': dest_hostname,
+                'block_migration': True,
+            }
+        }
+        self.api.post_server_action(server['id'], post)
+        # The compute manager will put the migration record into error status
+        # when pre_live_migration fails, so wait for that to happen.
+        migration = self._wait_for_migration_status(server, 'error')
+        # The _rollback_live_migration method in the compute manager will reset
+        # the task_state on the instance, so wait for that to happen.
+        server = self._wait_for_server_parameter(
+            self.api, server, {'OS-EXT-STS:task_state': None})
+
+        self.assertEqual(source_hostname, migration['source_compute'])
+        self.assertEqual(dest_hostname, migration['dest_compute'])
+
+        source_usages = self._get_provider_usages(source_rp_uuid)
+        # Since the instance didn't move, assert the allocations are still
+        # on the source node.
+        self.assertFlavorMatchesAllocation(self.flavor1, source_usages)
+
+        dest_usages = self._get_provider_usages(dest_rp_uuid)
+        # Assert the allocations, created by the scheduler, are cleaned up
+        # after the rollback happens.
+        self.assertFlavorMatchesAllocation(
+            {'vcpus': 0, 'ram': 0, 'disk': 0}, dest_usages)
+
+        allocations = self._get_allocations_by_server_uuid(server['id'])
+        # There should only be 1 allocation for the instance on the source node
+        self.assertEqual(1, len(allocations))
+        self.assertIn(source_rp_uuid, allocations)
+        self.assertFlavorMatchesAllocation(
+            self.flavor1, allocations[source_rp_uuid]['resources'])
+
+        self._delete_and_check_allocations(
+            server, source_rp_uuid, dest_rp_uuid)
 
     def test_rescheduling_when_migrating_instance(self):
         """Tests that allocations are removed from the destination node by
@@ -2006,7 +2489,8 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
         # Now migrate the server which is going to fail on the destination.
         self.api.post_server_action(server['id'], {'migrate': None})
 
-        self._wait_for_prep_resize_fail_completion(server, 'migrate')
+        self._wait_for_action_fail_completion(
+            server, instance_actions.MIGRATE, 'compute_prep_resize')
 
         dest_hostname = self._other_hostname(source_hostname)
         dest_rp_uuid = self._get_provider_uuid_by_host(dest_hostname)
@@ -2021,9 +2505,10 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
         source_usages = self._get_provider_usages(source_rp_uuid)
         self.assertFlavorMatchesAllocation(self.flavor1, source_usages)
 
-    def test_resize_to_same_host_prep_resize_fails(self):
+    def _test_resize_to_same_host_instance_fails(self, failing_method,
+                                                 event_name):
         """Tests that when we resize to the same host and resize fails in
-        the prep_resize method, we cleanup the allocations before rescheduling.
+        the given method, we cleanup the allocations before rescheduling.
         """
         # make sure that the test only uses a single host
         compute2_service_id = self.admin_api.get_services(
@@ -2035,16 +2520,17 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
 
         server = self._boot_and_check_allocations(self.flavor1, hostname)
 
-        def fake_prep_resize(*args, **kwargs):
+        def fake_resize_method(*args, **kwargs):
             # Ensure the allocations are doubled now before we fail.
             usages = self._get_provider_usages(rp_uuid)
             self.assertFlavorsMatchAllocation(
                 self.flavor1, self.flavor2, usages)
-            raise test.TestingException('Simulated _prep_resize failure.')
+            raise test.TestingException('Simulated resize failure.')
 
         # Yes this isn't great in a functional test, but it's simple.
-        self.stub_out('nova.compute.manager.ComputeManager._prep_resize',
-                      fake_prep_resize)
+        self.stub_out(
+            'nova.compute.manager.ComputeManager.%s' % failing_method,
+            fake_resize_method)
 
         self.flags(allow_resize_to_same_host=True)
         resize_req = {
@@ -2054,7 +2540,8 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
         }
         self.api.post_server_action(server['id'], resize_req)
 
-        self._wait_for_prep_resize_fail_completion(server, 'resize')
+        self._wait_for_action_fail_completion(
+            server, instance_actions.RESIZE, event_name)
 
         # Ensure the allocation records still exist on the host.
         source_rp_uuid = self._get_provider_uuid_by_host(hostname)
@@ -2062,3 +2549,305 @@ class ServerMovingTests(test.TestCase, integrated_helpers.InstanceHelperMixin):
         # The new_flavor should have been subtracted from the doubled
         # allocation which just leaves us with the original flavor.
         self.assertFlavorMatchesAllocation(self.flavor1, source_usages)
+
+    def test_resize_to_same_host_prep_resize_fails(self):
+        self._test_resize_to_same_host_instance_fails(
+            '_prep_resize', 'compute_prep_resize')
+
+    def test_resize_instance_fails_allocation_cleanup(self):
+        self._test_resize_to_same_host_instance_fails(
+            '_resize_instance', 'compute_resize_instance')
+
+    def test_finish_resize_fails_allocation_cleanup(self):
+        self._test_resize_to_same_host_instance_fails(
+            '_finish_resize', 'compute_finish_resize')
+
+    def _mock_live_migration(self, context, instance, dest,
+                             post_method, recover_method,
+                             block_migration=False, migrate_data=None):
+        self._abort_migration = False
+        self._migrating = True
+        while self._migrating:
+            time.sleep(0.5)
+
+        if self._abort_migration:
+            recover_method(context, instance, dest)
+        else:
+            post_method(context, instance, dest, block_migration,
+                        migrate_data)
+
+    def _mock_force_complete(self, instance):
+        self._migrating = False
+
+    def _mock_live_migration_abort(self, instance):
+        self._abort_migration = True
+        self._migrating = False
+
+    @mock.patch('nova.virt.fake.FakeDriver.live_migration')
+    @mock.patch('nova.virt.fake.FakeDriver.live_migration_force_complete')
+    def test_live_migrate_force_complete(self, mock_force_complete,
+                                         mock_live_migration):
+        self._migrating = True
+        mock_force_complete.side_effect = self._mock_force_complete
+        mock_live_migration.side_effect = self._mock_live_migration
+        # Note(lajos katona): By mocking the live_migration we simulate
+        # the libvirt driver and the real migration that takes time.
+        source_hostname = self.compute1.host
+        dest_hostname = self.compute2.host
+        source_rp_uuid = self._get_provider_uuid_by_host(source_hostname)
+        dest_rp_uuid = self._get_provider_uuid_by_host(dest_hostname)
+
+        server = self._boot_and_check_allocations(
+            self.flavor1, source_hostname)
+
+        post = {
+            'os-migrateLive': {
+                'host': dest_hostname,
+                'block_migration': True,
+            }
+        }
+        self.api.post_server_action(server['id'], post)
+
+        migration = self._wait_for_migration_status(server, 'running')
+        self.api.force_complete_migration(server['id'],
+                                          migration['id'])
+
+        self._wait_for_server_parameter(self.api, server,
+                                        {'OS-EXT-SRV-ATTR:host': dest_hostname,
+                                         'status': 'ACTIVE'})
+
+        self._run_periodics()
+
+        source_usages = self._get_provider_usages(source_rp_uuid)
+        self.assertFlavorMatchesAllocation(
+            {'ram': 0, 'disk': 0, 'vcpus': 0}, source_usages)
+
+        dest_usages = self._get_provider_usages(dest_rp_uuid)
+        self.assertFlavorMatchesAllocation(self.flavor1, dest_usages)
+
+        allocations = self._get_allocations_by_server_uuid(server['id'])
+        self.assertEqual(1, len(allocations))
+        self.assertNotIn(source_rp_uuid, allocations)
+
+        dest_allocation = allocations[dest_rp_uuid]['resources']
+        self.assertFlavorMatchesAllocation(self.flavor1, dest_allocation)
+
+        self._delete_and_check_allocations(
+            server, source_rp_uuid, dest_rp_uuid)
+
+    @mock.patch('nova.virt.fake.FakeDriver.live_migration')
+    @mock.patch('nova.virt.fake.FakeDriver.live_migration_abort')
+    def test_live_migrate_delete(self, mock_live_migration_abort,
+                                 mock_live_migration):
+        mock_live_migration.side_effect = self._mock_live_migration
+        mock_live_migration_abort.side_effect = self._mock_live_migration_abort
+
+        source_hostname = self.compute1.host
+        dest_hostname = self.compute2.host
+        source_rp_uuid = self._get_provider_uuid_by_host(source_hostname)
+        dest_rp_uuid = self._get_provider_uuid_by_host(dest_hostname)
+
+        server = self._boot_and_check_allocations(
+            self.flavor1, source_hostname)
+
+        post = {
+            'os-migrateLive': {
+                'host': dest_hostname,
+                'block_migration': True,
+            }
+        }
+        self.api.post_server_action(server['id'], post)
+
+        migration = self._wait_for_migration_status(server, 'running')
+
+        self.api.delete_migration(server['id'], migration['id'])
+        self._wait_for_server_parameter(self.api, server,
+            {'OS-EXT-SRV-ATTR:host': source_hostname,
+             'status': 'ACTIVE'})
+
+        self._run_periodics()
+
+        allocations = self._get_allocations_by_server_uuid(server['id'])
+        self.assertEqual(1, len(allocations))
+        self.assertNotIn(dest_rp_uuid, allocations)
+
+        source_usages = self._get_provider_usages(source_rp_uuid)
+        self.assertFlavorMatchesAllocation(self.flavor1, source_usages)
+
+        source_allocation = allocations[source_rp_uuid]['resources']
+        self.assertFlavorMatchesAllocation(self.flavor1, source_allocation)
+
+        dest_usages = self._get_provider_usages(dest_rp_uuid)
+        self.assertFlavorMatchesAllocation(
+           {'ram': 0, 'disk': 0, 'vcpus': 0}, dest_usages)
+
+        self._delete_and_check_allocations(
+            server, source_rp_uuid, dest_rp_uuid)
+
+
+class ServerRescheduleTests(ProviderUsageBaseTestCase):
+    """Tests server create scenarios which trigger a reschedule during
+    a server build and validates that allocations in Placement
+    are properly cleaned up.
+
+    Uses a fake virt driver that fails the build on the first attempt.
+    """
+
+    compute_driver = 'fake.FakeRescheduleDriver'
+
+    def setUp(self):
+        super(ServerRescheduleTests, self).setUp()
+        fake.set_nodes(['host1'])
+        self.flags(host='host1')
+        self.compute1 = self.start_service('compute', host='host1')
+
+        # NOTE(sbauza): Make sure the FakeDriver returns a different nodename
+        # for the second compute node.
+        fake.set_nodes(['host2'])
+        self.addCleanup(fake.restore_nodes)
+        self.flags(host='host2')
+        self.compute2 = self.start_service('compute', host='host2')
+
+        flavors = self.api.get_flavors()
+        self.flavor1 = flavors[0]
+
+    def _other_hostname(self, host):
+        other_host = {'host1': 'host2',
+                      'host2': 'host1'}
+        return other_host[host]
+
+    def test_rescheduling_when_booting_instance(self):
+        """Tests that allocations, created by the scheduler, are cleaned
+        from the source node when the build fails on that node and is
+        rescheduled to another node.
+        """
+        server_req = self._build_minimal_create_server_request(
+                self.api, 'some-server', flavor_id=self.flavor1['id'],
+                image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
+                networks=[])
+
+        created_server = self.api.post_server({'server': server_req})
+        server = self._wait_for_state_change(
+                self.api, created_server, 'ACTIVE')
+        dest_hostname = server['OS-EXT-SRV-ATTR:host']
+        failed_hostname = self._other_hostname(dest_hostname)
+
+        LOG.info('failed on %s', failed_hostname)
+        LOG.info('booting on %s', dest_hostname)
+
+        failed_rp_uuid = self._get_provider_uuid_by_host(failed_hostname)
+        dest_rp_uuid = self._get_provider_uuid_by_host(dest_hostname)
+
+        failed_usages = self._get_provider_usages(failed_rp_uuid)
+        # Expects no allocation records on the failed host.
+        self.assertFlavorMatchesAllocation(
+           {'vcpus': 0, 'ram': 0, 'disk': 0}, failed_usages)
+
+        # Ensure the allocation records on the destination host.
+        dest_usages = self._get_provider_usages(dest_rp_uuid)
+        self.assertFlavorMatchesAllocation(self.flavor1, dest_usages)
+
+
+class ServerBuildAbortTests(ProviderUsageBaseTestCase):
+    """Tests server create scenarios which trigger a build abort during
+    a server build and validates that allocations in Placement
+    are properly cleaned up.
+
+    Uses a fake virt driver that aborts the build on the first attempt.
+    """
+
+    compute_driver = 'fake.FakeBuildAbortDriver'
+
+    def setUp(self):
+        super(ServerBuildAbortTests, self).setUp()
+        # We only need one compute service/host/node for these tests.
+        fake.set_nodes(['host1'])
+        self.flags(host='host1')
+        self.compute1 = self.start_service('compute', host='host1')
+
+        flavors = self.api.get_flavors()
+        self.flavor1 = flavors[0]
+
+    def test_abort_when_booting_instance(self):
+        """Tests that allocations, created by the scheduler, are cleaned
+        from the source node when the build is aborted on that node.
+        """
+        server_req = self._build_minimal_create_server_request(
+                self.api, 'some-server', flavor_id=self.flavor1['id'],
+                image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
+                networks=[])
+
+        created_server = self.api.post_server({'server': server_req})
+        self._wait_for_state_change(self.api, created_server, 'ERROR')
+
+        failed_hostname = self.compute1.manager.host
+
+        failed_rp_uuid = self._get_provider_uuid_by_host(failed_hostname)
+        failed_usages = self._get_provider_usages(failed_rp_uuid)
+        # Expects no allocation records on the failed host.
+        self.assertFlavorMatchesAllocation(
+           {'vcpus': 0, 'ram': 0, 'disk': 0}, failed_usages)
+
+
+class ServerUnshelveSpawnFailTests(ProviderUsageBaseTestCase):
+    """Tests server unshelve scenarios which trigger a
+    VirtualInterfaceCreateException during driver.spawn() and validates that
+    allocations in Placement are properly cleaned up.
+    """
+
+    compute_driver = 'fake.FakeUnshelveSpawnFailDriver'
+
+    def setUp(self):
+        super(ServerUnshelveSpawnFailTests, self).setUp()
+        # We only need one compute service/host/node for these tests.
+        fake.set_nodes(['host1'])
+        self.flags(host='host1')
+        self.compute1 = self.start_service('compute', host='host1')
+
+        flavors = self.api.get_flavors()
+        self.flavor1 = flavors[0]
+
+    def test_driver_spawn_fail_when_unshelving_instance(self):
+        """Tests that allocations, created by the scheduler, are cleaned
+        from the target node when the unshelve driver.spawn fails on that node.
+        """
+        hostname = self.compute1.manager.host
+        rp_uuid = self._get_provider_uuid_by_host(hostname)
+        usages = self._get_provider_usages(rp_uuid)
+        # We start with no usages on the host.
+        self.assertFlavorMatchesAllocation(
+           {'vcpus': 0, 'ram': 0, 'disk': 0}, usages)
+
+        server_req = self._build_minimal_create_server_request(
+            self.api, 'unshelve-spawn-fail', flavor_id=self.flavor1['id'],
+            image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
+            networks='none')
+
+        server = self.api.post_server({'server': server_req})
+        self._wait_for_state_change(self.api, server, 'ACTIVE')
+
+        # assert allocations exist for the host
+        usages = self._get_provider_usages(rp_uuid)
+        self.assertFlavorMatchesAllocation(self.flavor1, usages)
+
+        # shelve offload the server
+        self.flags(shelved_offload_time=0)
+        self.api.post_server_action(server['id'], {'shelve': None})
+        self._wait_for_server_parameter(
+            self.api, server, {'status': 'SHELVED_OFFLOADED',
+                               'OS-EXT-SRV-ATTR:host': None})
+
+        # assert allocations were removed from the host
+        usages = self._get_provider_usages(rp_uuid)
+        self.assertFlavorMatchesAllocation(
+           {'vcpus': 0, 'ram': 0, 'disk': 0}, usages)
+
+        # unshelve the server, which should fail
+        self.api.post_server_action(server['id'], {'unshelve': None})
+        self._wait_for_action_fail_completion(
+            server, instance_actions.UNSHELVE, 'compute_unshelve_instance')
+
+        # assert allocations were removed from the host
+        usages = self._get_provider_usages(rp_uuid)
+        self.assertFlavorMatchesAllocation(
+           {'vcpus': 0, 'ram': 0, 'disk': 0}, usages)

@@ -89,6 +89,7 @@ from nova.pci import whitelist
 from nova import rpc
 from nova import safe_utils
 from nova.scheduler import client as scheduler_client
+from nova.scheduler import utils as scheduler_utils
 from nova import utils
 from nova.virt import block_device as driver_block_device
 from nova.virt import configdrive
@@ -513,6 +514,7 @@ class ComputeManager(manager.Manager):
             openstack_driver.is_neutron_security_groups())
         self.cells_rpcapi = cells_rpcapi.CellsAPI()
         self.scheduler_client = scheduler_client.SchedulerClient()
+        self.reportclient = self.scheduler_client.reportclient
         self._resource_tracker = None
         self.instance_events = InstanceEvents()
         self._sync_power_pool = eventlet.GreenPool(
@@ -649,6 +651,12 @@ class ComputeManager(manager.Manager):
         local_instances = self._get_instances_on_driver(context)
         evacuated = [inst for inst in local_instances
                      if inst.uuid in evacuations]
+
+        # NOTE(gibi): We are called from init_host and at this point the
+        # compute_nodes of the resource tracker has not been populated yet so
+        # we cannot rely on the resource tracker here.
+        compute_nodes = {}
+
         for instance in evacuated:
             migration = evacuations[instance.uuid]
             LOG.info('Deleting instance as it has been evacuated from '
@@ -672,9 +680,28 @@ class ComputeManager(manager.Manager):
                                 network_info,
                                 bdi, destroy_disks)
 
-            rt = self._get_resource_tracker()
-            rt.delete_allocation_for_evacuated_instance(
-                instance, migration.source_node)
+            # delete the allocation of the evacuated instance from this host
+            if migration.source_node not in compute_nodes:
+                try:
+                    cn_uuid = objects.ComputeNode.get_by_host_and_nodename(
+                        context, self.host, migration.source_node).uuid
+                    compute_nodes[migration.source_node] = cn_uuid
+                except exception.ComputeHostNotFound:
+                    LOG.error("Failed to clean allocation of evacuated "
+                              "instance as the source node %s is not found",
+                              migration.source_node, instance=instance)
+                    continue
+            cn_uuid = compute_nodes[migration.source_node]
+
+            my_resources = scheduler_utils.resources_from_flavor(
+                instance, instance.flavor)
+            res = self.reportclient.remove_provider_from_instance_allocation(
+                instance.uuid, cn_uuid, instance.user_id,
+                instance.project_id, my_resources)
+            if not res:
+                LOG.error("Failed to clean allocation of evacuated instance "
+                          "on the source node %s",
+                          cn_uuid, instance=instance)
 
             migration.status = 'completed'
             migration.save()
@@ -1448,7 +1475,6 @@ class ComputeManager(manager.Manager):
         instance.vm_state = vm_states.BUILDING
         instance.task_state = task_states.NETWORKING
         instance.save(expected_task_state=[None])
-        self._update_resource_tracker(context, instance)
 
         is_vpn = False
         return network_model.NetworkInfoAsyncWrapper(
@@ -1838,7 +1864,7 @@ class ComputeManager(manager.Manager):
                     instance=instance)
                 self._cleanup_allocated_networks(context, instance,
                     requested_networks)
-                self._cleanup_volumes(context, instance.uuid,
+                self._cleanup_volumes(context, instance,
                     block_device_mapping, raise_exc=False)
                 compute_utils.add_instance_fault_from_exc(context,
                         instance, e, sys.exc_info(),
@@ -1854,12 +1880,21 @@ class ComputeManager(manager.Manager):
             retry['exc_reason'] = e.kwargs['reason']
             # NOTE(comstud): Deallocate networks if the driver wants
             # us to do so.
+            # NOTE(mriedem): Always deallocate networking when using Neutron.
+            # This is to unbind any ports that the user supplied in the server
+            # create request, or delete any ports that nova created which were
+            # meant to be bound to this host. This check intentionally bypasses
+            # the result of deallocate_networks_on_reschedule because the
+            # default value in the driver is False, but that method was really
+            # only meant for Ironic and should be removed when nova-network is
+            # removed (since is_neutron() will then always be True).
             # NOTE(vladikr): SR-IOV ports should be deallocated to
             # allow new sriov pci devices to be allocated on a new host.
             # Otherwise, if devices with pci addresses are already allocated
             # on the destination host, the instance will fail to spawn.
             # info_cache.network_info should be present at this stage.
             if (self.driver.deallocate_networks_on_reschedule(instance) or
+                utils.is_neutron() or
                 self.deallocate_sriov_ports_on_reschedule(instance)):
                 self._cleanup_allocated_networks(context, instance,
                         requested_networks)
@@ -1891,7 +1926,7 @@ class ComputeManager(manager.Manager):
             LOG.exception(e.format_message(), instance=instance)
             self._cleanup_allocated_networks(context, instance,
                     requested_networks)
-            self._cleanup_volumes(context, instance.uuid,
+            self._cleanup_volumes(context, instance,
                     block_device_mapping, raise_exc=False)
             compute_utils.add_instance_fault_from_exc(context, instance,
                     e, sys.exc_info())
@@ -1905,7 +1940,7 @@ class ComputeManager(manager.Manager):
                           instance=instance)
             self._cleanup_allocated_networks(context, instance,
                     requested_networks)
-            self._cleanup_volumes(context, instance.uuid,
+            self._cleanup_volumes(context, instance,
                     block_device_mapping, raise_exc=False)
             compute_utils.add_instance_fault_from_exc(context, instance,
                     e, sys.exc_info())
@@ -2351,14 +2386,27 @@ class ComputeManager(manager.Manager):
                     self.host, action=fields.NotificationAction.SHUTDOWN,
                     phase=fields.NotificationPhase.END)
 
-    def _cleanup_volumes(self, context, instance_uuid, bdms, raise_exc=True):
+    def _cleanup_volumes(self, context, instance, bdms, raise_exc=True,
+                         detach=True):
         exc_info = None
-
         for bdm in bdms:
-            LOG.debug("terminating bdm %s", bdm,
-                      instance_uuid=instance_uuid)
+            if detach and bdm.volume_id:
+                try:
+                    LOG.debug("Detaching volume: %s", bdm.volume_id,
+                              instance_uuid=instance.uuid)
+                    destroy = bdm.delete_on_termination
+                    self._detach_volume(context, bdm, instance,
+                                        destroy_bdm=destroy)
+                except Exception as exc:
+                    exc_info = sys.exc_info()
+                    LOG.warning('Failed to detach volume: %(volume_id)s '
+                                'due to %(exc)s',
+                                {'volume_id': bdm.volume_id, 'exc': exc})
+
             if bdm.volume_id and bdm.delete_on_termination:
                 try:
+                    LOG.debug("Deleting volume: %s", bdm.volume_id,
+                              instance_uuid=instance.uuid)
                     self.volume_api.delete(context, bdm.volume_id)
                 except Exception as exc:
                     exc_info = sys.exc_info()
@@ -2410,8 +2458,14 @@ class ComputeManager(manager.Manager):
         #             future to set an instance fault the first time
         #             and to only ignore the failure if the instance
         #             is already in ERROR.
-        self._cleanup_volumes(context, instance.uuid, bdms,
-                raise_exc=False)
+
+        # NOTE(ameeda): The volumes already detached during the above
+        #               _shutdown_instance() call and this is why
+        #               detach is not requested from _cleanup_volumes()
+        #               in this case
+
+        self._cleanup_volumes(context, instance, bdms,
+                raise_exc=False, detach=False)
         # if a delete task succeeded, always update vm state and task
         # state without expecting task state to be DELETING
         instance.vm_state = vm_states.DELETED
@@ -2748,23 +2802,14 @@ class ComputeManager(manager.Manager):
 
         LOG.info("Rebuilding instance", instance=instance)
 
-        # NOTE(gyee): there are three possible scenarios.
-        #
-        #   1. instance is being rebuilt on the same node. In this case,
-        #      recreate should be False and scheduled_node should be None.
-        #   2. instance is being rebuilt on a node chosen by the
-        #      scheduler (i.e. evacuate). In this case, scheduled_node should
-        #      be specified and recreate should be True.
-        #   3. instance is being rebuilt on a node chosen by the user. (i.e.
-        #      force evacuate). In this case, scheduled_node is not specified
-        #      and recreate is set to True.
-        #
-        # For scenarios #2 and #3, we must do rebuild claim as server is
-        # being evacuated to a different node.
-        if recreate or scheduled_node is not None:
+        if recreate:
+            # This is an evacuation to a new host, so we need to perform a
+            # resource claim.
             rt = self._get_resource_tracker()
             rebuild_claim = rt.rebuild_claim
         else:
+            # This is a rebuild to the same host, so we don't need to make
+            # a claim since the instance is already on this host.
             rebuild_claim = claims.NopClaim
 
         image_meta = {}
@@ -2802,6 +2847,13 @@ class ComputeManager(manager.Manager):
                 # NOTE(ndipanov): We just abort the build for now and leave a
                 # migration record for potential cleanup later
                 self._set_migration_status(migration, 'failed')
+                # Since the claim failed, we need to remove the allocation
+                # created against the destination node. Note that we can only
+                # get here when evacuating to a destination node. Rebuilding
+                # on the same host (not evacuate) uses the NopClaim which will
+                # not raise ComputeResourcesUnavailable.
+                rt.delete_allocation_for_evacuated_instance(
+                    instance, scheduled_node, node_type='destination')
                 self._notify_instance_rebuild_error(context, instance, e)
 
                 raise exception.BuildAbortException(
@@ -3284,6 +3336,12 @@ class ComputeManager(manager.Manager):
                     LOG.info("Failed to find image %(image_id)s to "
                              "delete", {'image_id': image_id},
                              instance=instance)
+                except (exception.ImageDeleteConflict, Exception) as exc:
+                    LOG.info("Failed to delete image %(image_id)s during "
+                             "deleting excess backups. "
+                             "Continuing for next image.. %(exc)s",
+                             {'image_id': image_id, 'exc': exc},
+                             instance=instance)
 
     @wrap_exception()
     @reverts_task_state
@@ -3553,6 +3611,7 @@ class ComputeManager(manager.Manager):
 
             network_info = self.network_api.get_instance_nw_info(context,
                                                                  instance)
+            # TODO(mriedem): Get BDMs here and pass them to the driver.
             self.driver.confirm_migration(context, migration, instance,
                                           network_info)
 
@@ -3882,6 +3941,18 @@ class ComputeManager(manager.Manager):
                         reservations, migration, instance_type,
                         clean_shutdown):
         """Starts the migration of a running instance to another host."""
+        try:
+            self._resize_instance(context, instance, image, migration,
+                                  instance_type, clean_shutdown)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                rt = self._get_resource_tracker()
+                node = self.driver.get_available_nodes(refresh=True)[0]
+                rt.delete_allocation_for_failed_resize(
+                    instance, node, instance_type)
+
+    def _resize_instance(self, context, instance, image,
+                         migration, instance_type, clean_shutdown):
         with self._error_out_instance_on_exception(context, instance):
             # TODO(chaochin) Remove this until v5 RPC API
             # Code downstream may expect extra_specs to be populated since it
@@ -4062,6 +4133,23 @@ class ComputeManager(manager.Manager):
         Sets up the newly transferred disk and turns on the instance at its
         new host machine.
 
+        """
+        try:
+            self._finish_resize_helper(context, disk_info, image, instance,
+                                       migration)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                rt = self._get_resource_tracker()
+                node = self.driver.get_available_nodes(refresh=True)[0]
+                rt.delete_allocation_for_failed_resize(
+                    instance, node, instance.new_flavor)
+
+    def _finish_resize_helper(self, context, disk_info, image, instance,
+                              migration):
+        """Completes the migration process.
+
+        The caller must revert the instance's allocations if the migration
+        process failed.
         """
         with self._error_out_instance_on_exception(context, instance):
             image_meta = objects.ImageMeta.from_dict(image)
@@ -4378,10 +4466,18 @@ class ComputeManager(manager.Manager):
         self.network_api.cleanup_instance_network_on_host(context, instance,
                                                           instance.host)
         network_info = self.network_api.get_instance_nw_info(context, instance)
+        bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+            context, instance.uuid)
+
         block_device_info = self._get_instance_block_device_info(context,
-                                                                 instance)
+                                                                 instance,
+                                                                 bdms=bdms)
         self.driver.destroy(context, instance, network_info,
                 block_device_info)
+
+        # the instance is going to be removed from the host so we want to
+        # terminate all the connections with the volume server and the host
+        self._terminate_volume_connections(context, instance, bdms)
 
         instance.power_state = current_power_state
         # NOTE(mriedem): The vm_state has to be set before updating the
@@ -4492,9 +4588,20 @@ class ComputeManager(manager.Manager):
                                   network_info=network_info,
                                   block_device_info=block_device_info)
         except Exception:
-            with excutils.save_and_reraise_exception():
+            with excutils.save_and_reraise_exception(logger=LOG):
                 LOG.exception('Instance failed to spawn',
                               instance=instance)
+                # Cleanup allocations created by the scheduler on this host
+                # since we failed to spawn the instance. We do this both if
+                # the instance claim failed with ComputeResourcesUnavailable
+                # or if we did claim but the spawn failed, because aborting the
+                # instance claim will not remove the allocations.
+                rt.reportclient.delete_allocation_for_instance(instance.uuid)
+                # FIXME: Umm, shouldn't we be rolling back port bindings too?
+                self._terminate_volume_connections(context, instance, bdms)
+                # The reverts_task_state decorator on unshelve_instance will
+                # eventually save these updates.
+                self._nil_out_instance_obj_host_and_node(instance)
 
         if image:
             instance.image_ref = shelved_image_ref
@@ -5003,8 +5110,8 @@ class ComputeManager(manager.Manager):
                       "old: %(old_cinfo)s",
                       {'new_cinfo': new_cinfo, 'old_cinfo': old_cinfo},
                       instance=instance)
-            self.driver.swap_volume(old_cinfo, new_cinfo, instance, mountpoint,
-                                    resize_to)
+            self.driver.swap_volume(context, old_cinfo, new_cinfo, instance,
+                                    mountpoint, resize_to)
             LOG.debug("swap_volume: Driver volume swap returned, new "
                       "connection_info is now : %(new_cinfo)s",
                       {'new_cinfo': new_cinfo})
@@ -5822,6 +5929,19 @@ class ComputeManager(manager.Manager):
             Contains the status we want to set for the migration object
 
         """
+        # Remove allocations created in Placement for the dest node.
+        # NOTE(mriedem): The migrate_data.migration object does not have the
+        # dest_node (or dest UUID) set, so we have to lookup the destination
+        # ComputeNode with only the hostname.
+        dest_node = objects.ComputeNode.get_first_node_by_host_for_old_compat(
+            context, dest, use_slave=True)
+        reportclient = self.scheduler_client.reportclient
+        resources = scheduler_utils.resources_from_flavor(
+            instance, instance.flavor)
+        reportclient.remove_provider_from_instance_allocation(
+            instance.uuid, dest_node.uuid, instance.user_id,
+            instance.project_id, resources)
+
         instance.task_state = None
         instance.progress = 0
         instance.save(expected_task_state=[task_states.MIGRATING])
@@ -6766,7 +6886,7 @@ class ComputeManager(manager.Manager):
                     try:
                         self._shutdown_instance(context, instance, bdms,
                                                 notify=False)
-                        self._cleanup_volumes(context, instance.uuid, bdms)
+                        self._cleanup_volumes(context, instance, bdms)
                     except Exception as e:
                         LOG.warning("Periodic cleanup failed to delete "
                                     "instance: %s",

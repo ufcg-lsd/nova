@@ -55,15 +55,43 @@ Nova Database
     determined by ``[database]/connection`` in the configuration file passed to
     nova-manage.
 
-``nova-manage db archive_deleted_rows [--max_rows <number>] [--verbose]``
+``nova-manage db archive_deleted_rows [--max_rows <number>] [--verbose] [--until-complete]``
 
     Move deleted rows from production tables to shadow tables. Specifying
     --verbose will print the results of the archive operation for any tables
-    that were changed.
+    that were changed. Specifying --until-complete will make the command run
+    continuously until all deleted rows are archived. Use the --max_rows option,
+    which defaults to 1000, as a batch size for each iteration.
 
 ``nova-manage db null_instance_uuid_scan [--delete]``
 
     Lists and optionally deletes database records where instance_uuid is NULL.
+
+``nova-manage db ironic_flavor_migration [--all] [--host] [--node] [--resource_class]``
+
+   Perform the ironic flavor migration process against the database
+   while services are offline. This is `not recommended` for most
+   people. The ironic compute driver will do this online and as
+   necessary if run normally. This routine is provided only for
+   advanced users that may be skipping the 16.0.0 Pike release, never
+   able to run services normally at the Pike level. Since this utility
+   is for use when all services (including ironic) are down, you must
+   pass the resource class set on your node(s) with the
+   ``--resource_class`` parameter.
+
+   To migrate a specific host and node, provide the hostname and node uuid with
+   ``--host $hostname --node $uuid``. To migrate all instances on nodes managed
+   by a single host, provide only ``--host``. To iterate over all nodes in the
+   system in a single pass, use ``--all``. Note that this process is not lightweight,
+   so it should not be run frequently without cause, although it is not harmful
+   to do so. If you have multiple cellsv2 cells, you should run this once per cell
+   with the corresponding cell config for each (i.e. this does not iterate cells
+   automatically).
+
+   Note that this is not recommended unless you need to run this
+   specific data migration offline, and it should be used with care as
+   the work done is non-trivial. Running smaller and more targeted batches (such as
+   specific nodes) is recommended.
 
 Nova API Database
 ~~~~~~~~~~~~~~~~~
@@ -143,17 +171,21 @@ Nova Cells v2
     transport url or database connection was missing, and 2 if a cell is
     already using that transport url and database connection combination.
 
-``nova-manage cell_v2 discover_hosts [--cell_uuid <cell_uuid>] [--verbose] [--strict]``
+``nova-manage cell_v2 discover_hosts [--cell_uuid <cell_uuid>] [--verbose] [--strict] [--by-service]``
 
     Searches cells, or a single cell, and maps found hosts. This command will
-    check the database for each cell (or a single one if passed in) and map
-    any hosts which are not currently mapped. If a host is already mapped
-    nothing will be done. You need to re-run this command each time you add
-    more compute hosts to a cell (otherwise the scheduler will never place
-    instances there and the API will not list the new hosts). If the strict
-    option is provided the command will only be considered successful if an
-    unmapped host is discovered (exit code 0). Any other case is considered a
-    failure (exit code 1).
+    check the database for each cell (or a single one if passed in) and map any
+    hosts which are not currently mapped. If a host is already mapped nothing
+    will be done. You need to re-run this command each time you add more
+    compute hosts to a cell (otherwise the scheduler will never place instances
+    there and the API will not list the new hosts). If the strict option is
+    provided the command will only be considered successful if an unmapped host
+    is discovered (exit code 0). Any other case is considered a failure (exit
+    code 1). If --by-service is specified, this command will look in the
+    appropriate cell(s) for any nova-compute services and ensure there are host
+    mappings for them. This is less efficient and is only necessary when using
+    compute drivers that may manage zero or more actual compute nodes at any
+    given time (currently only ironic).
 
 ``nova-manage cell_v2 list_cells [--verbose]``
 
@@ -161,12 +193,14 @@ Nova Cells v2
     uuid are shown. Use the --verbose option to see transport url and
     database connection details.
 
-``nova-manage cell_v2 delete_cell --cell_uuid <cell_uuid>``
+``nova-manage cell_v2 delete_cell [--force] --cell_uuid <cell_uuid>``
 
-    Delete an empty cell by the given uuid. Returns 0 if the empty cell is
-    found and deleted successfully, 1 if a cell with that uuid could not be
-    found, 2 if host mappings were found for the cell (cell not empty), and
-    3 if there are instances mapped to the cell (cell not empty).
+    Delete a cell by the given uuid. Returns 0 if the empty cell is
+    found and deleted successfully or the cell that has hosts is found and
+    the cell and the hosts are deleted successfully with ``--force`` option,
+    1 if a cell with that uuid could not be found, 2 if host mappings were
+    found for the cell (cell not empty) without ``--force`` option, and 3
+    if there are instances mapped to the cell (cell not empty).
 
 ``nova-manage cell_v2 update_cell --cell_uuid <cell_uuid> [--name <cell_name>] [--transport-url <transport_url>] [--database_connection <database_connection>]``
 
@@ -182,6 +216,14 @@ Nova Cells v2
     NOTE: Updating the transport_url or database_connection fields on
     a running system will NOT result in all nodes immediately using the
     new values. Use caution when changing these values.
+
+``nova-manage cell_v2 delete_host --cell_uuid <cell_uuid> --host <host>``
+
+    Delete a host by the given host name and the given cell uuid. Returns 0
+    if the empty host is found and deleted successfully, 1 if a cell with
+    that uuid could not be found, 2 if a host with that name could not be
+    found, 3 if a host with that name is not in a cell with that uuid, 4 if
+    a host with that name has instances (host not empty).
 
 Nova Logs
 ~~~~~~~~~

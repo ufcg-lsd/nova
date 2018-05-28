@@ -482,7 +482,7 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
         instance.
         """
         ctx = mock.Mock(user_id=uuids.user_id)
-        spec_obj = mock.Mock(project_id=uuids.project_id)
+        spec_obj = objects.RequestSpec(project_id=uuids.project_id)
         instance_uuid = uuids.instance
         alloc_reqs = [mock.sentinel.alloc_req]
 
@@ -494,6 +494,16 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
         pc.claim_resources.assert_called_once_with(uuids.instance,
             mock.sentinel.alloc_req, uuids.project_id, uuids.user_id)
         self.assertTrue(res)
+
+    @mock.patch('nova.scheduler.utils.request_is_rebuild')
+    def test_claim_resouces_for_policy_check(self, mock_policy):
+        mock_policy.return_value = True
+        res = self.driver._claim_resources(None, mock.sentinel.spec_obj,
+                                           mock.sentinel.instance_uuid,
+                                           [])
+        self.assertTrue(res)
+        mock_policy.assert_called_once_with(mock.sentinel.spec_obj)
+        self.assertFalse(self.placement_client.claim_resources.called)
 
     def test_add_retry_host(self):
         retry = dict(num_attempts=1, hosts=[])
@@ -527,7 +537,7 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
     def test_select_destinations_match_num_instances(self, mock_schedule):
         """Tests that the select_destinations() method returns the list of
         hosts from the _schedule() method when the number of returned hosts
-        equals the num_instances on the spec object
+        equals the number of instance UUIDs passed in.
         """
         spec_obj = objects.RequestSpec(
             flavor=objects.Flavor(memory_mb=512,
@@ -541,11 +551,41 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
         mock_schedule.return_value = [mock.sentinel.hs1]
 
         dests = self.driver.select_destinations(self.context, spec_obj,
-            mock.sentinel.instance_uuids, mock.sentinel.alloc_reqs_by_rp_uuid,
+            [mock.sentinel.instance_uuid], mock.sentinel.alloc_reqs_by_rp_uuid,
             mock.sentinel.p_sums)
 
         mock_schedule.assert_called_once_with(self.context, spec_obj,
-            mock.sentinel.instance_uuids, mock.sentinel.alloc_reqs_by_rp_uuid,
+            [mock.sentinel.instance_uuid], mock.sentinel.alloc_reqs_by_rp_uuid,
+            mock.sentinel.p_sums)
+
+        self.assertEqual([mock.sentinel.hs1], dests)
+
+    @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                '_schedule')
+    def test_select_destinations_for_move_ops(self, mock_schedule):
+        """Tests that the select_destinations() method verifies the number of
+        hosts returned from the _schedule() method against the number of
+        instance UUIDs passed as a parameter and not against the RequestSpec
+        num_instances field since the latter could be wrong in case of a move
+        operation.
+        """
+        spec_obj = objects.RequestSpec(
+            flavor=objects.Flavor(memory_mb=512,
+                                  root_gb=512,
+                                  ephemeral_gb=0,
+                                  swap=0,
+                                  vcpus=1),
+            project_id=uuids.project_id,
+            num_instances=2)
+
+        mock_schedule.return_value = [mock.sentinel.hs1]
+
+        dests = self.driver.select_destinations(self.context, spec_obj,
+            [mock.sentinel.instance_uuid], mock.sentinel.alloc_reqs_by_rp_uuid,
+            mock.sentinel.p_sums)
+
+        mock_schedule.assert_called_once_with(self.context, spec_obj,
+            [mock.sentinel.instance_uuid], mock.sentinel.alloc_reqs_by_rp_uuid,
             mock.sentinel.p_sums)
 
         self.assertEqual([mock.sentinel.hs1], dests)
@@ -571,8 +611,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
 
         self.assertRaises(exception.NoValidHost,
             self.driver.select_destinations, self.context, spec_obj,
-            mock.sentinel.instance_uuids, mock.sentinel.alloc_reqs_by_rp_uuid,
-            mock.sentinel.p_sums)
+            [mock.sentinel.instance_uuid1, mock.sentinel.instance_uuid2],
+            mock.sentinel.alloc_reqs_by_rp_uuid, mock.sentinel.p_sums)
 
         # Verify that the host state object has been marked as not updated so
         # it's picked up in the next pull from the DB for compute node objects
@@ -599,3 +639,29 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
                 mock.call(self.context, 'scheduler.select_destinations.end',
                  dict(request_spec=expected))]
             self.assertEqual(expected, mock_info.call_args_list)
+
+    def test_get_all_host_states_provider_summaries_is_none(self):
+        """Tests that HostManager.get_host_states_by_uuids is called with
+        compute_uuids being None when the incoming provider_summaries is None.
+        """
+        with mock.patch.object(self.driver.host_manager,
+                               'get_host_states_by_uuids') as get_host_states:
+            self.driver._get_all_host_states(
+                mock.sentinel.ctxt, mock.sentinel.spec_obj, None)
+        # Make sure get_host_states_by_uuids was called with
+        # compute_uuids being None.
+        get_host_states.assert_called_once_with(
+            mock.sentinel.ctxt, None, mock.sentinel.spec_obj)
+
+    def test_get_all_host_states_provider_summaries_is_empty(self):
+        """Tests that HostManager.get_host_states_by_uuids is called with
+        compute_uuids being [] when the incoming provider_summaries is {}.
+        """
+        with mock.patch.object(self.driver.host_manager,
+                               'get_host_states_by_uuids') as get_host_states:
+            self.driver._get_all_host_states(
+                mock.sentinel.ctxt, mock.sentinel.spec_obj, {})
+        # Make sure get_host_states_by_uuids was called with
+        # compute_uuids being [].
+        get_host_states.assert_called_once_with(
+            mock.sentinel.ctxt, [], mock.sentinel.spec_obj)

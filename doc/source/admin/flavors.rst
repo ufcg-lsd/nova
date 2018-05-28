@@ -18,12 +18,9 @@ manage flavors. To see information for this command, run:
 
 .. note::
 
-   - Configuration rights can be delegated to additional users by redefining
-     the access controls for ``compute_extension:flavormanage`` in
-     ``/etc/nova/policy.json`` on the ``nova-api`` server.
-
-   - The Dashboard simulates the ability to modify a flavor by deleting an
-     existing flavor and creating a new one with the same name.
+   Configuration rights can be delegated to additional users by redefining
+   the access controls for ``os_compute_api:os-flavor-manage`` in
+   ``/etc/nova/policy.json`` on the ``nova-api`` server.
 
 Flavors define these elements:
 
@@ -414,6 +411,8 @@ CPU pinning policy
      The ``hw:cpu_thread_policy`` option is only valid if ``hw:cpu_policy`` is
      set to ``dedicated``.
 
+.. _extra-specs-numa-topology:
+
 NUMA topology
   For the libvirt driver, you can define the host NUMA placement for the
   instance vCPU threads as well as the allocation of instance vCPUs and memory
@@ -507,9 +506,8 @@ PCI passthrough
   Where:
 
   - ALIAS: (string) The alias which correspond to a particular PCI device class
-    as configured in the nova configuration file (see `nova.conf configuration
-    options
-    <https://docs.openstack.org/ocata/config-reference/compute/config-options.html>`_).
+    as configured in the nova configuration file (see
+    :doc:`/configuration/config`).
   - COUNT: (integer) The amount of PCI devices of type ALIAS to be assigned to
     a guest.
 

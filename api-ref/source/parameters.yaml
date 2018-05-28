@@ -1189,7 +1189,7 @@ addresses:
     in a state set in the ``hide_server_address_states`` configuration option.
     By default, servers in ``building`` state hide their addresses information.
     See ``nova.conf`` `configuration options
-    <https://docs.openstack.org/ocata/config-reference/compute/config-options.html>`_
+    <https://docs.openstack.org/nova/latest/configuration/config.html>`_
     for more information.
   in: body
   required: true
@@ -1302,7 +1302,8 @@ aggregate_az:
   type: string
 aggregate_az_optional:
   description: |
-    The availability zone of the host aggregate.
+    The availability zone of the host aggregate. The availability zone must
+    not include ':' in its name.
   in: body
   required: false
   type: string
@@ -1646,8 +1647,8 @@ config_drive:
     setting provides information about a drive that the instance can mount at boot
     time. The instance reads files from the drive to get information that is normally
     available through the metadata service. This metadata is different from the user
-    data. Not all cloud providers enable the ``config_drive``. Read more in the OpenStack
-    End User Guide.
+    data. Not all cloud providers enable the ``config_drive``. Read more in the
+    `OpenStack End User Guide <https://docs.openstack.org/nova/latest/user/config-drive.html>`_.
   in: body
   required: false
   type: boolean

@@ -37,6 +37,7 @@ from oslo_utils import fixture as utils_fixture
 from oslo_utils import timeutils
 from oslo_utils import units
 from oslo_utils import uuidutils
+import six
 import testtools
 from testtools import matchers as testtools_matchers
 
@@ -921,7 +922,7 @@ class ComputeVolumeTestCase(BaseTestCase):
         for expected, got in zip(expected_result, preped_bdm):
             self.assertThat(expected, matchers.IsSubDictOf(got))
 
-    @mock.patch.object(objects.Service, 'get_minimum_version',
+    @mock.patch.object(objects.service, 'get_minimum_version_all_cells',
         return_value=17)
     def test_validate_bdm(self, mock_get_min_ver):
         def fake_get(self, context, res_id):
@@ -1266,7 +1267,7 @@ class ComputeVolumeTestCase(BaseTestCase):
                           self.context, self.instance,
                           instance_type, bdms)
 
-    @mock.patch.object(objects.Service, 'get_minimum_version',
+    @mock.patch.object(objects.service, 'get_minimum_version_all_cells',
                        return_value=17)
     @mock.patch.object(cinder.API, 'get')
     @mock.patch.object(cinder.API, 'check_availability_zone')
@@ -3525,6 +3526,74 @@ class ComputeTestCase(BaseTestCase,
                                      rotation=1)
         self.assertEqual(2, mock_delete.call_count)
 
+    @mock.patch('nova.image.api.API.get_all')
+    def test_rotate_backups_with_image_delete_failed(self,
+            mock_get_all_images):
+        instance = self._create_fake_instance_obj()
+        instance_uuid = instance['uuid']
+        fake_images = [{
+            'id': uuids.image_id_1,
+            'created_at': timeutils.parse_strtime('2017-01-04T00:00:00.00'),
+            'name': 'fake_name_1',
+            'status': 'active',
+            'properties': {'kernel_id': uuids.kernel_id_1,
+                           'ramdisk_id': uuids.ramdisk_id_1,
+                           'image_type': 'backup',
+                           'backup_type': 'daily',
+                           'instance_uuid': instance_uuid},
+        },
+        {
+            'id': uuids.image_id_2,
+            'created_at': timeutils.parse_strtime('2017-01-03T00:00:00.00'),
+            'name': 'fake_name_2',
+            'status': 'active',
+            'properties': {'kernel_id': uuids.kernel_id_2,
+                           'ramdisk_id': uuids.ramdisk_id_2,
+                           'image_type': 'backup',
+                           'backup_type': 'daily',
+                           'instance_uuid': instance_uuid},
+        },
+        {
+            'id': uuids.image_id_3,
+            'created_at': timeutils.parse_strtime('2017-01-02T00:00:00.00'),
+            'name': 'fake_name_3',
+            'status': 'active',
+            'properties': {'kernel_id': uuids.kernel_id_3,
+                           'ramdisk_id': uuids.ramdisk_id_3,
+                           'image_type': 'backup',
+                           'backup_type': 'daily',
+                           'instance_uuid': instance_uuid},
+        },
+        {
+            'id': uuids.image_id_4,
+            'created_at': timeutils.parse_strtime('2017-01-01T00:00:00.00'),
+            'name': 'fake_name_4',
+            'status': 'active',
+            'properties': {'kernel_id': uuids.kernel_id_4,
+                           'ramdisk_id': uuids.ramdisk_id_4,
+                           'image_type': 'backup',
+                           'backup_type': 'daily',
+                           'instance_uuid': instance_uuid},
+        }]
+
+        mock_get_all_images.return_value = fake_images
+
+        def _check_image_id(context, image_id):
+            self.assertIn(image_id, [uuids.image_id_2, uuids.image_id_3,
+                                     uuids.image_id_4])
+            if image_id == uuids.image_id_3:
+                raise Exception('fake %s delete exception' % image_id)
+            if image_id == uuids.image_id_4:
+                raise exception.ImageDeleteConflict(reason='image is in use')
+
+        with mock.patch.object(nova.image.api.API, 'delete',
+                               side_effect=_check_image_id) as mock_delete:
+            # Fake images 4,3,2 should be rotated in sequence
+            self.compute._rotate_backups(self.context, instance=instance,
+                                         backup_type='daily',
+                                         rotation=1)
+            self.assertEqual(3, mock_delete.call_count)
+
     def test_console_output(self):
         # Make sure we can get console output from instance.
         instance = self._create_fake_instance_obj()
@@ -4401,8 +4470,15 @@ class ComputeTestCase(BaseTestCase,
 
         func = getattr(self.compute, operation)
 
-        self.assertRaises(test.TestingException,
-                func, self.context, instance=instance, **kwargs)
+        with mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                        'delete_allocation_for_failed_resize') as delete_alloc:
+            self.assertRaises(test.TestingException,
+                    func, self.context, instance=instance, **kwargs)
+            if operation == 'resize_instance':
+                delete_alloc.assert_called_once_with(
+                    instance, 'fakenode1', kwargs['instance_type'])
+            else:
+                delete_alloc.assert_not_called()
         # self.context.elevated() is called in tearDown()
         self.stub_out('nova.context.RequestContext.elevated', orig_elevated)
         self.stub_out('nova.compute.manager.ComputeManager.'
@@ -4418,6 +4494,7 @@ class ComputeTestCase(BaseTestCase,
         # ensure that task_state is reverted after a failed operation.
         migration = objects.Migration(context=self.context.elevated())
         migration.instance_uuid = 'b48316c5-71e8-45e4-9884-6c78055b9b13'
+        migration.uuid = mock.sentinel.uuid
         migration.new_instance_type_id = '1'
         instance_type = objects.Flavor()
 
@@ -5107,7 +5184,9 @@ class ComputeTestCase(BaseTestCase,
                           clean_shutdown=True)
         self.compute.terminate_instance(self.context, instance, [], [])
 
-    def test_resize_instance_driver_error(self):
+    @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                'delete_allocation_for_failed_resize')
+    def test_resize_instance_driver_error(self, delete_alloc):
         # Ensure instance status set to Error on resize error.
 
         def throw_up(*args, **kwargs):
@@ -5147,7 +5226,9 @@ class ComputeTestCase(BaseTestCase,
         self.assertEqual(instance.vm_state, vm_states.ERROR)
         self.compute.terminate_instance(self.context, instance, [], [])
 
-    def test_resize_instance_driver_rollback(self):
+    @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                'delete_allocation_for_failed_resize')
+    def test_resize_instance_driver_rollback(self, delete_alloc):
         # Ensure instance status set to Running after rollback.
 
         def throw_up(*args, **kwargs):
@@ -5770,7 +5851,9 @@ class ComputeTestCase(BaseTestCase,
         flavor_type = flavors.get_flavor_by_flavor_id(1)
         self.assertEqual(flavor_type['name'], 'm1.tiny')
 
-    def test_resize_instance_handles_migration_error(self):
+    @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                'delete_allocation_for_failed_resize')
+    def test_resize_instance_handles_migration_error(self, delete_alloc):
         # Ensure vm_state is ERROR when error occurs.
         def raise_migration_failure(*args):
             raise test.TestingException()
@@ -5867,6 +5950,10 @@ class ComputeTestCase(BaseTestCase,
 
     @mock.patch.object(fake.FakeDriver, 'get_instance_disk_info')
     @mock.patch.object(compute_rpcapi.ComputeAPI, 'pre_live_migration')
+    @mock.patch.object(objects.ComputeNode,
+                       'get_first_node_by_host_for_old_compat')
+    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                'remove_provider_from_instance_allocation')
     @mock.patch.object(objects.BlockDeviceMappingList, 'get_by_instance_uuid')
     @mock.patch.object(compute_rpcapi.ComputeAPI, 'remove_volume_connection')
     @mock.patch.object(compute_rpcapi.ComputeAPI,
@@ -5874,7 +5961,8 @@ class ComputeTestCase(BaseTestCase,
     @mock.patch('nova.objects.Migration.save')
     def test_live_migration_exception_rolls_back(self, mock_save,
                                 mock_rollback, mock_remove,
-                                mock_get_uuid, mock_pre, mock_get_disk):
+                                mock_get_uuid, mock_remove_allocs,
+                                mock_get_node, mock_pre, mock_get_disk):
         # Confirm exception when pre_live_migration fails.
         c = context.get_admin_context()
 
@@ -5884,7 +5972,9 @@ class ComputeTestCase(BaseTestCase,
         updated_instance = self._create_fake_instance_obj(
                                                {'host': 'fake-dest-host'})
         dest_host = updated_instance['host']
-        fake_bdms = [
+        dest_node = objects.ComputeNode(host=dest_host, uuid=uuids.dest_node)
+        mock_get_node.return_value = dest_node
+        fake_bdms = objects.BlockDeviceMappingList(objects=[
                 objects.BlockDeviceMapping(
                     **fake_block_device.FakeDbBlockDeviceDict(
                         {'volume_id': uuids.volume_id_1,
@@ -5895,7 +5985,7 @@ class ComputeTestCase(BaseTestCase,
                         {'volume_id': uuids.volume_id_2,
                          'source_type': 'volume',
                          'destination_type': 'volume'}))
-        ]
+        ])
         migrate_data = migrate_data_obj.XenapiLiveMigrateData(
             block_migration=True)
 
@@ -5925,6 +6015,9 @@ class ComputeTestCase(BaseTestCase,
                 block_device_info=block_device_info)
         mock_pre.assert_called_once_with(c,
                 instance, True, 'fake_disk', dest_host, migrate_data)
+        mock_remove_allocs.assert_called_once_with(
+            instance.uuid, dest_node.uuid, instance.user_id,
+            instance.project_id, test.MatchType(dict))
         mock_setup.assert_called_once_with(c, instance, self.compute.host)
         mock_get_uuid.assert_called_with(c, instance.uuid)
         mock_remove.assert_has_calls([
@@ -6259,14 +6352,21 @@ class ComputeTestCase(BaseTestCase,
             terminate_connection.assert_called_once_with(
                     c, uuids.volume_id, 'fake-connector')
 
+    @mock.patch.object(objects.ComputeNode,
+                       'get_first_node_by_host_for_old_compat')
+    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                'remove_provider_from_instance_allocation')
     @mock.patch('nova.objects.BlockDeviceMappingList.get_by_instance_uuid')
-    def test_rollback_live_migration(self, mock_bdms):
+    def test_rollback_live_migration(self, mock_bdms, mock_remove_allocs,
+                                     mock_get_node):
         c = context.get_admin_context()
         instance = mock.MagicMock()
         migration = mock.MagicMock()
         migrate_data = {'migration': migration}
 
-        mock_bdms.return_value = []
+        dest_node = objects.ComputeNode(host='foo', uuid=uuids.dest_node)
+        mock_get_node.return_value = dest_node
+        mock_bdms.return_value = objects.BlockDeviceMappingList()
 
         @mock.patch('nova.compute.utils.notify_about_instance_action')
         @mock.patch.object(self.compute, '_live_migration_cleanup_flags')
@@ -6275,6 +6375,9 @@ class ComputeTestCase(BaseTestCase,
             mock_lmcf.return_value = False, False
             self.compute._rollback_live_migration(c, instance, 'foo',
                                                   migrate_data=migrate_data)
+            mock_remove_allocs.assert_called_once_with(
+                instance.uuid, dest_node.uuid, instance.user_id,
+                instance.project_id, test.MatchType(dict))
             mock_notify.assert_has_calls([
                 mock.call(c, instance, self.compute.host,
                           action='live_migration_rollback', phase='start'),
@@ -6288,14 +6391,22 @@ class ComputeTestCase(BaseTestCase,
         self.assertEqual(0, instance.progress)
         migration.save.assert_called_once_with()
 
+    @mock.patch.object(objects.ComputeNode,
+                       'get_first_node_by_host_for_old_compat')
+    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                'remove_provider_from_instance_allocation')
     @mock.patch('nova.objects.BlockDeviceMappingList.get_by_instance_uuid')
-    def test_rollback_live_migration_set_migration_status(self, mock_bdms):
+    def test_rollback_live_migration_set_migration_status(self, mock_bdms,
+                                                          mock_remove_allocs,
+                                                          mock_get_node):
         c = context.get_admin_context()
         instance = mock.MagicMock()
         migration = mock.MagicMock()
         migrate_data = {'migration': migration}
 
-        mock_bdms.return_value = []
+        dest_node = objects.ComputeNode(host='foo', uuid=uuids.dest_node)
+        mock_get_node.return_value = dest_node
+        mock_bdms.return_value = objects.BlockDeviceMappingList()
 
         @mock.patch('nova.compute.utils.notify_about_instance_action')
         @mock.patch.object(self.compute, '_live_migration_cleanup_flags')
@@ -6305,6 +6416,9 @@ class ComputeTestCase(BaseTestCase,
             self.compute._rollback_live_migration(c, instance, 'foo',
                                                   migrate_data=migrate_data,
                                                   migration_status='fake')
+            mock_remove_allocs.assert_called_once_with(
+                instance.uuid, dest_node.uuid, instance.user_id,
+                instance.project_id, test.MatchType(dict))
             mock_notify.assert_has_calls([
                 mock.call(c, instance, self.compute.host,
                           action='live_migration_rollback', phase='start'),
@@ -6607,7 +6721,7 @@ class ComputeTestCase(BaseTestCase,
         mock_shutdown.assert_has_calls([
             mock.call(ctxt, inst1, bdms, notify=False),
             mock.call(ctxt, inst2, bdms, notify=False)])
-        mock_cleanup.assert_called_once_with(ctxt, inst2['uuid'], bdms)
+        mock_cleanup.assert_called_once_with(ctxt, inst2, bdms)
         mock_get_uuid.assert_has_calls([
             mock.call(ctxt, inst1.uuid, use_slave=True),
             mock.call(ctxt, inst2.uuid, use_slave=True)])
@@ -8526,14 +8640,19 @@ class ComputeAPITestCase(BaseTestCase):
                           "new password")
 
     def test_rebuild_no_image(self):
+        """Tests that rebuild fails if no root BDM is found for an instance
+        without an image_ref (volume-backed instance).
+        """
         instance = self._create_fake_instance_obj(params={'image_ref': ''})
-        instance_uuid = instance.uuid
         self.stub_out('nova.tests.unit.image.fake._FakeImageService.show',
                       self.fake_show)
-        self.compute_api.rebuild(self.context, instance, '', 'new_password')
-
-        instance = db.instance_get_by_uuid(self.context, instance_uuid)
-        self.assertEqual(instance['task_state'], task_states.REBUILDING)
+        # The API request schema validates that a UUID is passed for the
+        # imageRef parameter so we need to provide an image.
+        ex = self.assertRaises(exception.NovaException,
+                               self.compute_api.rebuild, self.context,
+                               instance, self.fake_image['id'], 'new_password')
+        self.assertIn('Unable to find root block device mapping for '
+                      'volume-backed instance', six.text_type(ex))
 
     def test_rebuild_with_deleted_image(self):
         # If we're given a deleted image by glance, we should not be able to

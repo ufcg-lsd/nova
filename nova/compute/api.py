@@ -1330,8 +1330,11 @@ class API(base.Base):
                         "destination_type 'volume' need to have a non-zero "
                         "size specified"))
             elif volume_id is not None:
-                min_compute_version = objects.Service.get_minimum_version(
-                    context, 'nova-compute')
+                # The instance is being created and we don't know which
+                # cell it's going to land in, so check all cells.
+                min_compute_version = \
+                    objects.service.get_minimum_version_all_cells(
+                        context, ['nova-compute'])
                 try:
                     # NOTE(ildikov): The boot from volume operation did not
                     # reserve the volume before Pike and as the older computes
@@ -1349,6 +1352,13 @@ class API(base.Base):
                         volume = self._check_attach(context, volume_id,
                                                     instance)
                     bdm.volume_size = volume.get('size')
+
+                    # NOTE(mnaser): If we end up reserving the volume, it will
+                    #               not have an attachment_id which is needed
+                    #               for cleanups.  This can be removed once
+                    #               all calls to reserve_volume are gone.
+                    if 'attachment_id' not in bdm:
+                        bdm.attachment_id = None
                 except (exception.CinderConnectionFailed,
                         exception.InvalidVolume):
                     raise
@@ -1777,6 +1787,11 @@ class API(base.Base):
             # instance is now in a cell and the delete needs to proceed
             # normally.
             return False
+
+        # We need to detach from any volumes so they aren't orphaned.
+        self._local_cleanup_bdm_volumes(
+            build_req.block_device_mappings, instance, context)
+
         return True
 
     def _delete(self, context, instance, delete_type, cb, **instance_attrs):
@@ -1785,12 +1800,12 @@ class API(base.Base):
             return
 
         cell = None
-        # If there is an instance.host (or the instance is shelved-offloaded),
-        # the instance has been scheduled and sent to a cell/compute which
-        # means it was pulled from the cell db.
+        # If there is an instance.host (or the instance is shelved-offloaded or
+        # in error state), the instance has been scheduled and sent to a
+        # cell/compute which means it was pulled from the cell db.
         # Normal delete should be attempted.
-        if not (instance.host or
-                instance.vm_state == vm_states.SHELVED_OFFLOADED):
+        may_have_ports_or_volumes = self._may_have_ports_or_volumes(instance)
+        if not instance.host and not may_have_ports_or_volumes:
             try:
                 if self._delete_while_booting(context, instance):
                     return
@@ -1869,9 +1884,7 @@ class API(base.Base):
                 # which will cause a cast to the child cell.
                 cb(context, instance, bdms)
                 return
-            shelved_offloaded = (instance.vm_state
-                                 == vm_states.SHELVED_OFFLOADED)
-            if not instance.host and not shelved_offloaded:
+            if not instance.host and not may_have_ports_or_volumes:
                 try:
                     compute_utils.notify_about_instance_usage(
                             self.notifier, context, instance,
@@ -1886,7 +1899,12 @@ class API(base.Base):
                              {'state': instance.vm_state},
                               instance=instance)
                     return
-                except exception.ObjectActionError:
+                except exception.ObjectActionError as ex:
+                    # The instance's host likely changed under us as
+                    # this instance could be building and has since been
+                    # scheduled. Continue with attempts to delete it.
+                    LOG.debug('Refreshing instance because: %s', ex,
+                              instance=instance)
                     instance.refresh()
 
             if instance.vm_state == vm_states.RESIZED:
@@ -1894,7 +1912,8 @@ class API(base.Base):
 
             is_local_delete = True
             try:
-                if not shelved_offloaded:
+                # instance.host must be set in order to look up the service.
+                if instance.host is not None:
                     service = objects.Service.get_by_compute_host(
                         context.elevated(), instance.host)
                     is_local_delete = not self.servicegroup_api.service_is_up(
@@ -1911,7 +1930,9 @@ class API(base.Base):
 
                     cb(context, instance, bdms)
             except exception.ComputeHostNotFound:
-                pass
+                LOG.debug('Compute host %s not found during service up check, '
+                          'going to local delete instance', instance.host,
+                          instance=instance)
 
             if is_local_delete:
                 # If instance is in shelved_offloaded state or compute node
@@ -1937,6 +1958,16 @@ class API(base.Base):
         except exception.InstanceNotFound:
             # NOTE(comstud): Race condition. Instance already gone.
             pass
+
+    def _may_have_ports_or_volumes(self, instance):
+        # NOTE(melwitt): When an instance build fails in the compute manager,
+        # the instance host and node are set to None and the vm_state is set
+        # to ERROR. In the case, the instance with host = None has actually
+        # been scheduled and may have ports and/or volumes allocated on the
+        # compute node.
+        if instance.vm_state in (vm_states.SHELVED_OFFLOADED, vm_states.ERROR):
+            return True
+        return False
 
     def _confirm_resize_on_deleting(self, context, instance):
         # If in the middle of a resize, use confirm_resize to
@@ -1993,6 +2024,14 @@ class API(base.Base):
                           'the instance host %(instance_host)s.',
                           {'connector_host': connector.get('host'),
                            'instance_host': instance.host}, instance=instance)
+                if (instance.host is None and
+                        self._may_have_ports_or_volumes(instance)):
+                    LOG.debug('Allowing use of stashed volume connector with '
+                              'instance host None because instance with '
+                              'vm_state %(vm_state)s has been scheduled in '
+                              'the past.', {'vm_state': instance.vm_state},
+                              instance=instance)
+                    return connector
 
     def _local_cleanup_bdm_volumes(self, bdms, instance, context):
         """The method deletes the bdm records and, if a bdm is a volume, call
@@ -2027,7 +2066,12 @@ class API(base.Base):
                 except Exception as exc:
                     LOG.warning("Ignoring volume cleanup failure due to %s",
                                 exc, instance=instance)
-            bdm.destroy()
+            # If we're cleaning up volumes from an instance that wasn't yet
+            # created in a cell, i.e. the user deleted the server while
+            # the BuildRequest still existed, then the BDM doesn't actually
+            # exist in the DB to destroy it.
+            if 'id' in bdm:
+                bdm.destroy()
 
     def _local_delete(self, context, instance, bdms, delete_type, cb):
         if instance.vm_state == vm_states.SHELVED_OFFLOADED:
@@ -2154,7 +2198,8 @@ class API(base.Base):
             instance.save(expected_task_state=[None])
 
     @check_instance_lock
-    @check_instance_state(must_have_launched=False)
+    @check_instance_state(task_state=None,
+                          must_have_launched=False)
     def force_delete(self, context, instance):
         """Force delete an instance in any vm_state/task_state."""
         self._delete(context, instance, 'force_delete', self._do_force_delete,
@@ -2374,9 +2419,17 @@ class API(base.Base):
         # [sorted instances with no host] + [sorted instances with host].
         # This means BuildRequest and cell0 instances first, then cell
         # instances
-        build_requests = objects.BuildRequestList.get_by_filters(
-            context, filters, limit=limit, marker=marker, sort_keys=sort_keys,
-            sort_dirs=sort_dirs)
+        try:
+            build_requests = objects.BuildRequestList.get_by_filters(
+                context, filters, limit=limit, marker=marker,
+                sort_keys=sort_keys, sort_dirs=sort_dirs)
+            # If we found the marker in we need to set it to None
+            # so we don't expect to find it in the cells below.
+            marker = None
+        except exception.MarkerNotFound:
+            # If we didn't find the marker in the build requests then keep
+            # looking for it in the cells.
+            build_requests = objects.BuildRequestList()
         build_req_instances = objects.InstanceList(
             objects=[build_req.instance for build_req in build_requests])
         # Only subtract from limit if it is not None
@@ -2810,6 +2863,8 @@ class API(base.Base):
         quiesced = False
         if instance.vm_state == vm_states.ACTIVE:
             try:
+                LOG.info("Attempting to quiesce instance before volume "
+                         "snapshot.", instance=instance)
                 self.compute_rpcapi.quiesce_instance(context, instance)
                 quiesced = True
             except (exception.InstanceQuiesceNotSupported,
@@ -2827,28 +2882,43 @@ class API(base.Base):
                 context, instance.uuid)
 
         mapping = []
-        for bdm in bdms:
-            if bdm.no_device:
-                continue
+        try:
+            for bdm in bdms:
+                if bdm.no_device:
+                    continue
 
-            if bdm.is_volume:
-                # create snapshot based on volume_id
-                volume = self.volume_api.get(context, bdm.volume_id)
-                # NOTE(yamahata): Should we wait for snapshot creation?
-                #                 Linux LVM snapshot creation completes in
-                #                 short time, it doesn't matter for now.
-                name = _('snapshot for %s') % image_meta['name']
-                LOG.debug('Creating snapshot from volume %s.', volume['id'],
-                          instance=instance)
-                snapshot = self.volume_api.create_snapshot_force(
-                    context, volume['id'], name, volume['display_description'])
-                mapping_dict = block_device.snapshot_from_bdm(snapshot['id'],
-                                                              bdm)
-                mapping_dict = mapping_dict.get_image_mapping()
-            else:
-                mapping_dict = bdm.get_image_mapping()
+                if bdm.is_volume:
+                    # create snapshot based on volume_id
+                    volume = self.volume_api.get(context, bdm.volume_id)
+                    # NOTE(yamahata): Should we wait for snapshot creation?
+                    # Linux LVM snapshot creation completes in short time,
+                    # it doesn't matter for now.
+                    name = _('snapshot for %s') % image_meta['name']
+                    LOG.debug('Creating snapshot from volume %s.',
+                              volume['id'], instance=instance)
+                    snapshot = self.volume_api.create_snapshot_force(
+                        context, volume['id'],
+                        name, volume['display_description'])
+                    mapping_dict = block_device.snapshot_from_bdm(
+                        snapshot['id'], bdm)
+                    mapping_dict = mapping_dict.get_image_mapping()
+                else:
+                    mapping_dict = bdm.get_image_mapping()
 
-            mapping.append(mapping_dict)
+                mapping.append(mapping_dict)
+        # NOTE(tasker): No error handling is done in the above for loop.
+        # This means that if the snapshot fails and throws an exception
+        # the traceback will skip right over the unquiesce needed below.
+        # Here, catch any exception, unquiesce the instance, and raise the
+        # error so that the calling function can do what it needs to in
+        # order to properly treat a failed snap.
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                if quiesced:
+                    LOG.info("Unquiescing instance after volume snapshot "
+                             "failure.", instance=instance)
+                    self.compute_rpcapi.unquiesce_instance(
+                        context, instance, mapping)
 
         if quiesced:
             self.compute_rpcapi.unquiesce_instance(context, instance, mapping)
@@ -2907,7 +2977,6 @@ class API(base.Base):
     def rebuild(self, context, instance, image_href, admin_password,
                 files_to_inject=None, **kwargs):
         """Rebuild the given instance with the provided attributes."""
-        orig_image_ref = instance.image_ref or ''
         files_to_inject = files_to_inject or []
         metadata = kwargs.get('metadata', {})
         preserve_ephemeral = kwargs.get('preserve_ephemeral', False)
@@ -2917,7 +2986,32 @@ class API(base.Base):
         self._check_auto_disk_config(image=image, **kwargs)
 
         flavor = instance.get_flavor()
-        root_bdm = compute_utils.get_root_bdm(context, instance)
+        bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+            context, instance.uuid)
+        root_bdm = compute_utils.get_root_bdm(context, instance, bdms)
+
+        # Check to see if the image is changing and we have a volume-backed
+        # server.
+        is_volume_backed = compute_utils.is_volume_backed_instance(
+            context, instance, bdms)
+        if is_volume_backed:
+            # For boot from volume, instance.image_ref is empty, so we need to
+            # query the image from the volume.
+            if root_bdm is None:
+                # This shouldn't happen and is an error, we need to fail. This
+                # is not the users fault, it's an internal error. Without a
+                # root BDM we have no way of knowing the backing volume (or
+                # image in that volume) for this instance.
+                raise exception.NovaException(
+                    _('Unable to find root block device mapping for '
+                      'volume-backed instance.'))
+
+            volume = self.volume_api.get(context, root_bdm.volume_id)
+            volume_image_metadata = volume.get('volume_image_metadata', {})
+            orig_image_ref = volume_image_metadata.get('image_id')
+        else:
+            orig_image_ref = instance.image_ref
+
         self._checks_for_create_and_rebuild(context, image_id, image,
                 flavor, metadata, files_to_inject, root_bdm)
 
@@ -2969,18 +3063,41 @@ class API(base.Base):
         # system metadata... and copy in the properties for the new image.
         orig_sys_metadata = _reset_image_metadata()
 
-        bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
-                context, instance.uuid)
-
         self._record_action_start(context, instance, instance_actions.REBUILD)
 
         # NOTE(sbauza): The migration script we provided in Newton should make
         # sure that all our instances are currently migrated to have an
         # attached RequestSpec object but let's consider that the operator only
         # half migrated all their instances in the meantime.
+        host = instance.host
         try:
             request_spec = objects.RequestSpec.get_by_instance_uuid(
                 context, instance.uuid)
+            # If a new image is provided on rebuild, we will need to run
+            # through the scheduler again, but we want the instance to be
+            # rebuilt on the same host it's already on.
+            if orig_image_ref != image_href:
+                # We have to modify the request spec that goes to the scheduler
+                # to contain the new image. We persist this since we've already
+                # changed the instance.image_ref above so we're being
+                # consistent.
+                request_spec.image = objects.ImageMeta.from_dict(image)
+                request_spec.save()
+                if 'scheduler_hints' not in request_spec:
+                    request_spec.scheduler_hints = {}
+                # Nuke the id on this so we can't accidentally save
+                # this hint hack later
+                del request_spec.id
+
+                # NOTE(danms): Passing host=None tells conductor to
+                # call the scheduler. The _nova_check_type hint
+                # requires that the scheduler returns only the same
+                # host that we are currently on and only checks
+                # rebuild-related filters.
+                request_spec.scheduler_hints['_nova_check_type'] = ['rebuild']
+                request_spec.force_hosts = [instance.host]
+                request_spec.force_nodes = [instance.node]
+                host = None
         except exception.RequestSpecNotFound:
             # Some old instances can still have no RequestSpec object attached
             # to them, we need to support the old way
@@ -2990,7 +3107,7 @@ class API(base.Base):
                 new_pass=admin_password, injected_files=files_to_inject,
                 image_ref=image_href, orig_image_ref=orig_image_ref,
                 orig_sys_metadata=orig_sys_metadata, bdms=bdms,
-                preserve_ephemeral=preserve_ephemeral, host=instance.host,
+                preserve_ephemeral=preserve_ephemeral, host=host,
                 request_spec=request_spec,
                 kwargs=kwargs)
 
@@ -3705,8 +3822,7 @@ class API(base.Base):
 
     @check_instance_lock
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
-                                    vm_states.SUSPENDED, vm_states.STOPPED,
-                                    vm_states.RESIZED, vm_states.SOFT_DELETED])
+                                    vm_states.RESIZED])
     def swap_volume(self, context, instance, old_volume, new_volume):
         """Swap volume attached to an instance."""
         # The caller likely got the instance from volume['attachments']
